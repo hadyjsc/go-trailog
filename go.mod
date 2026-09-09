@@ -1,4 +1,4 @@
-module github.com/trailog/trailog
+module github.com/hadyjsc/go-trailog
 
 go 1.26.4
 
