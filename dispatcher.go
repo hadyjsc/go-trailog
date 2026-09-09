@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/trailog/trailog/store"
+	"github.com/hadyjsc/go-trailog/store"
 )
 
 // dispatcher is the internal write-path abstraction: sync writes directly to the

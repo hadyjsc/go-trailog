@@ -11,9 +11,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/trailog/trailog"
-	"github.com/trailog/trailog/revert"
-	"github.com/trailog/trailog/timeline"
+	"github.com/hadyjsc/go-trailog"
+	"github.com/hadyjsc/go-trailog/revert"
+	"github.com/hadyjsc/go-trailog/timeline"
 )
 
 // ────────────────────────────────────────────────────────────────
@@ -26,7 +26,7 @@ type Invoice struct {
 	Amount   float64 `json:"amount"  trailog:"track"`
 	Status   string  `json:"status"  trailog:"track"`
 	Notes    string  `json:"notes"   trailog:"track"`
-	APIToken string  `json:"api_token" trailog:"-"`   // never tracked
+	APIToken string  `json:"api_token" trailog:"-"` // never tracked
 }
 
 // ────────────────────────────────────────────────────────────────

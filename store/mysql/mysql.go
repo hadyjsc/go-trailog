@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/trailog/trailog/store"
+	"github.com/hadyjsc/go-trailog/store"
 
 	_ "github.com/go-sql-driver/mysql" // MySQL driver
 )

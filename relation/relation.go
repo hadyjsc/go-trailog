@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/trailog/trailog/internal/types"
+	"github.com/hadyjsc/go-trailog/internal/types"
 )
 
 // Dependency describes the write-order constraint between parent and child entity types,

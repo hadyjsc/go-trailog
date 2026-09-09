@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/trailog/trailog/store"
+	"github.com/hadyjsc/go-trailog/store"
 )
 
 // ────────────────────────────────────────────────────────────────

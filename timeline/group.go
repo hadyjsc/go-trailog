@@ -3,7 +3,7 @@ package timeline
 import (
 	"time"
 
-	"github.com/trailog/trailog/store"
+	"github.com/hadyjsc/go-trailog/store"
 )
 
 // The types below are the timeline-package's public-facing view models.
@@ -96,10 +96,10 @@ func toRevision(r store.Revision) Revision {
 
 func toEntityChange(ec store.EntityChange) EntityChange {
 	out := EntityChange{
-		ID:         ec.ID,
-		RevisionID: ec.RevisionID,
-		Entity:     EntityRef{Type: ec.EntityType, ID: ec.EntityID},
-		Op:         ec.Op,
+		ID:             ec.ID,
+		RevisionID:     ec.RevisionID,
+		Entity:         EntityRef{Type: ec.EntityType, ID: ec.EntityID},
+		Op:             ec.Op,
 		SnapshotBefore: ec.SnapshotBefore,
 		SnapshotAfter:  ec.SnapshotAfter,
 	}

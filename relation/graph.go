@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/trailog/trailog/internal/types"
+	"github.com/hadyjsc/go-trailog/internal/types"
 )
 
 // Expand performs a BFS over the relation graph starting from root, following

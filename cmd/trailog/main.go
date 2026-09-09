@@ -22,11 +22,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/trailog/trailog"
-	"github.com/trailog/trailog/api"
-	"github.com/trailog/trailog/config"
-	"github.com/trailog/trailog/integration/httpmw"
-	"github.com/trailog/trailog/migrate"
+	"github.com/hadyjsc/go-trailog"
+	"github.com/hadyjsc/go-trailog/api"
+	"github.com/hadyjsc/go-trailog/config"
+	"github.com/hadyjsc/go-trailog/integration/httpmw"
+	"github.com/hadyjsc/go-trailog/migrate"
 
 	// Import all drivers so the side-effect registrations happen when the
 	// binary is compiled, regardless of which driver is chosen at runtime.

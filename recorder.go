@@ -8,15 +8,15 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/trailog/trailog/diff"
-	"github.com/trailog/trailog/store"
+	"github.com/hadyjsc/go-trailog/diff"
+	"github.com/hadyjsc/go-trailog/store"
 )
 
 // recordOptions holds per-call overrides applied via Option functions.
 type recordOptions struct {
-	reason     string
-	metadata   map[string]any
-	fieldMask  []string // fields to exclude at call site
+	reason    string
+	metadata  map[string]any
+	fieldMask []string // fields to exclude at call site
 }
 
 // Option is a functional option for Record* calls.

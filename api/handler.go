@@ -21,8 +21,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/trailog/trailog/revert"
-	"github.com/trailog/trailog/timeline"
+	"github.com/hadyjsc/go-trailog/revert"
+	"github.com/hadyjsc/go-trailog/timeline"
 )
 
 // Handler holds the service dependencies injected at construction time.

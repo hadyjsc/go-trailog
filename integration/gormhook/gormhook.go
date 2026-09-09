@@ -7,7 +7,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/trailog/trailog"
+	"github.com/hadyjsc/go-trailog"
 )
 
 const (

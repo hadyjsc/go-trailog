@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/trailog/trailog/relation"
-	"github.com/trailog/trailog/store"
+	"github.com/hadyjsc/go-trailog/relation"
+	"github.com/hadyjsc/go-trailog/store"
 )
 
 // Strategy controls how the reverter handles fields changed after the target revision.
@@ -32,7 +32,7 @@ type RevertOption func(*revertOptions)
 
 type revertOptions struct {
 	strategy Strategy
-	cascade  int    // relation hops to cascade revert to related entities
+	cascade  int // relation hops to cascade revert to related entities
 	reason   string
 }
 
