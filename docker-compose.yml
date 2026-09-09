@@ -1,0 +1,124 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trailog — local development stack
+#
+# Services:
+#   postgres   — PostgreSQL 16  (port 5432)
+#   mysql      — MySQL 8.0      (port 3306)
+#   sqlserver  — SQL Server 2022 (port 1433)
+#   trailog    — the API service (port 8080, built from source)
+#
+# Usage:
+#   make docker-up          # start all databases + trailog service
+#   make docker-db-up       # start databases only (for local dev with go run)
+#   make docker-down        # stop and remove containers
+#   make docker-logs        # tail all container logs
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  trailog:
+    driver: bridge
+
+volumes:
+  pg_data:
+  mysql_data:
+  mssql_data:
+
+services:
+
+  # ── PostgreSQL 16 ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: trailog_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-trailog}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trailog}
+      POSTGRES_DB:       ${POSTGRES_DB:-auditdb}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trailog} -d ${POSTGRES_DB:-auditdb}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - trailog
+
+  # ── MySQL 8.0 ────────────────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: trailog_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_USER:          ${MYSQL_USER:-trailog}
+      MYSQL_PASSWORD:      ${MYSQL_PASSWORD:-trailog}
+      MYSQL_DATABASE:      ${MYSQL_DATABASE:-auditdb}
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --default-time-zone=+00:00
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-root}"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    networks:
+      - trailog
+
+  # ── SQL Server 2022 ──────────────────────────────────────────────────────────
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: trailog_sqlserver
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA:        "Y"
+      MSSQL_SA_PASSWORD:  ${MSSQL_SA_PASSWORD:-Trailog1!}
+      MSSQL_PID:          Developer
+    ports:
+      - "${MSSQL_PORT:-1433}:1433"
+    volumes:
+      - mssql_data:/var/opt/mssql
+    healthcheck:
+      test: >
+        /opt/mssql-tools18/bin/sqlcmd
+        -S localhost -U sa -P "${MSSQL_SA_PASSWORD:-Trailog1!}"
+        -No -Q "SELECT 1" || exit 1
+      interval: 10s
+      timeout: 10s
+      retries: 15
+    networks:
+      - trailog
+
+  # ── Trailog API service ───────────────────────────────────────────────────────
+  trailog:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trailog_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override DSN to use the Docker network hostname instead of localhost.
+      TRAILOG_DB_DSN: >-
+        ${TRAILOG_DB_DSN:-postgres://trailog:trailog@postgres:5432/auditdb?sslmode=disable}
+      TRAILOG_RUN_MIGRATIONS: "true"
+    ports:
+      - "${TRAILOG_HTTP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - trailog
+    profiles:
+      # Only started by `make docker-up`, not `make docker-db-up`
+      - full
