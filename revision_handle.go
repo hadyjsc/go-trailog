@@ -6,7 +6,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
-	"github.com/trailog/trailog/store"
+	"github.com/hadyjsc/go-trailog/store"
 )
 
 // revisionHandleContextKey is the context key for an in-flight RevisionHandle.

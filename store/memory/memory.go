@@ -7,15 +7,15 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/trailog/trailog/store"
+	"github.com/hadyjsc/go-trailog/store"
 )
 
 // Store is an in-memory implementation of store.Store, suitable for tests.
 type Store struct {
-	mu          sync.RWMutex
-	revisions   map[string]*store.Revision  // id → revision (without changes)
-	changes     map[string][]store.EntityChange // revision_id → changes
-	revertLogs  map[string]*store.RevertLog  // id → revert log
+	mu         sync.RWMutex
+	revisions  map[string]*store.Revision      // id → revision (without changes)
+	changes    map[string][]store.EntityChange // revision_id → changes
+	revertLogs map[string]*store.RevertLog     // id → revert log
 	// Index: (entityType+":"+entityID) → []revisionID (insertion order)
 	entityIndex map[string][]string
 }

@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/trailog/trailog/relation"
-	"github.com/trailog/trailog/store"
+	"github.com/hadyjsc/go-trailog/relation"
+	"github.com/hadyjsc/go-trailog/store"
 )
 
 // Entity identifies a record. Aliased here so callers don't need to import
@@ -22,8 +22,8 @@ type Entity struct {
 type TimelineQuery struct {
 	Entity         Entity
 	IncludeRelated bool
-	RelationDepth  int      // how many relation hops to follow (default 1)
-	ActorID        string   // filter by actor
+	RelationDepth  int    // how many relation hops to follow (default 1)
+	ActorID        string // filter by actor
 	From           time.Time
 	To             time.Time
 	Actions        []string // filter by action type

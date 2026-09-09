@@ -22,15 +22,15 @@ package trailog
 import (
 	"fmt"
 
-	configPkg "github.com/trailog/trailog/config"
-	"github.com/trailog/trailog/relation"
-	"github.com/trailog/trailog/revert"
-	"github.com/trailog/trailog/store"
-	"github.com/trailog/trailog/store/memory"
-	"github.com/trailog/trailog/store/mysql"
-	"github.com/trailog/trailog/store/postgres"
-	"github.com/trailog/trailog/store/sqlserver"
-	"github.com/trailog/trailog/timeline"
+	configPkg "github.com/hadyjsc/go-trailog/config"
+	"github.com/hadyjsc/go-trailog/relation"
+	"github.com/hadyjsc/go-trailog/revert"
+	"github.com/hadyjsc/go-trailog/store"
+	"github.com/hadyjsc/go-trailog/store/memory"
+	"github.com/hadyjsc/go-trailog/store/mysql"
+	"github.com/hadyjsc/go-trailog/store/postgres"
+	"github.com/hadyjsc/go-trailog/store/sqlserver"
+	"github.com/hadyjsc/go-trailog/timeline"
 )
 
 // Dependency re-exported for use in WithRelation calls without importing the relation package.
@@ -87,13 +87,13 @@ func (t *Trailog) Close() error {
 // ────────────────────────────────────────────────────────────────
 
 type config struct {
-	store       store.Store
-	asyncBuffer int
+	store        store.Store
+	asyncBuffer  int
 	asyncWorkers int
-	asyncErrFn  func(error)
-	useAsync    bool
-	relations   []relationConfig
-	repos       map[string]revert.EntityRepository
+	asyncErrFn   func(error)
+	useAsync     bool
+	relations    []relationConfig
+	repos        map[string]revert.EntityRepository
 }
 
 type relationConfig struct {

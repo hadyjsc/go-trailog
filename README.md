@@ -36,11 +36,11 @@ audit_revision     ←→  audit_entity_change  ←→  audit_field_diff
 ## 1. Quick start
 
 ```bash
-go get github.com/trailog/trailog
+go get github.com/hadyjsc/go-trailog
 ```
 
 ```go
-import "github.com/trailog/trailog"
+import "github.com/hadyjsc/go-trailog"
 
 tl, err := trailog.New(
     trailog.WithPostgresStore("postgres://user:pass@localhost:5432/auditdb?sslmode=disable"),
@@ -142,8 +142,8 @@ Let trailog read its own config from the environment your app already populates:
 
 ```go
 import (
-    "github.com/trailog/trailog"
-    "github.com/trailog/trailog/config"
+    "github.com/hadyjsc/go-trailog"
+    "github.com/hadyjsc/go-trailog/config"
 )
 
 // Your app's main.go — no separate .env loading needed if env vars are
@@ -180,7 +180,7 @@ tl, err := trailog.New(trailog.WithEnvConfig(cfg))
 ```go
 import (
     "database/sql"
-    "github.com/trailog/trailog/migrate"
+    "github.com/hadyjsc/go-trailog/migrate"
     _ "github.com/lib/pq"
 )
 
@@ -705,7 +705,7 @@ GET /health
 ## 16. GORM hook integration
 
 ```go
-import "github.com/trailog/trailog/integration/gormhook"
+import "github.com/hadyjsc/go-trailog/integration/gormhook"
 
 // Register once at startup for each entity type.
 if err := gormhook.Register(db, tl.Recorder(), "invoice"); err != nil {
@@ -717,7 +717,7 @@ if err := gormhook.Register(db, tl.Recorder(), "invoice"); err != nil {
 HTTP middleware (injects Actor + CorrelationID per request):
 
 ```go
-import "github.com/trailog/trailog/integration/httpmw"
+import "github.com/hadyjsc/go-trailog/integration/httpmw"
 
 router.Use(httpmw.Middleware(httpmw.ActorFromJWT))
 // Or for service-to-service:
@@ -742,7 +742,7 @@ tl, _ := trailog.New(
 **Transactional outbox** — write intent row inside your business transaction, background flusher delivers to audit store:
 
 ```go
-import "github.com/trailog/trailog/outbox"
+import "github.com/hadyjsc/go-trailog/outbox"
 
 dispatcher := outbox.New(db, auditStore,
     outbox.WithPollInterval(2*time.Second),

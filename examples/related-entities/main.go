@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/trailog/trailog"
-	"github.com/trailog/trailog/revert"
-	"github.com/trailog/trailog/timeline"
+	"github.com/hadyjsc/go-trailog"
+	"github.com/hadyjsc/go-trailog/revert"
+	"github.com/hadyjsc/go-trailog/timeline"
 )
 
 // ────────────────────────────────────────────────────────────────

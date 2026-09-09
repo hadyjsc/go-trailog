@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/trailog/trailog"
+	"github.com/hadyjsc/go-trailog"
 )
 
 // ActorExtractor is a function that extracts an Actor from an HTTP request.

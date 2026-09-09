@@ -6,16 +6,16 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/trailog/trailog/integration/httpmw"
-	"github.com/trailog/trailog/revert"
-	"github.com/trailog/trailog/timeline"
+	"github.com/hadyjsc/go-trailog/integration/httpmw"
+	"github.com/hadyjsc/go-trailog/revert"
+	"github.com/hadyjsc/go-trailog/timeline"
 )
 
 // Server is the HTTP API server for the trailog audit service.
 // It owns its net/http.Server and exposes Start / Shutdown lifecycle methods.
 type Server struct {
-	http     *http.Server
-	handler  *Handler
+	http    *http.Server
+	handler *Handler
 }
 
 // ServerConfig holds HTTP server tuning parameters.
