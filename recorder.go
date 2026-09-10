@@ -146,14 +146,21 @@ func applyOpts(opts []Option) *recordOptions {
 
 func computeDiffs(before, after any, mask []string) ([]store.FieldDiff, error) {
 	rawDiffs, err := diff.Struct(before, after)
-	if err != nil {
-		// Fall back to JSON diff if struct diff fails (e.g. map[string]any input).
+	// Fall back to JSON diff when:
+	//   - diff.Struct returns an error (e.g. map[string]any or non-struct input), OR
+	//   - diff.Struct returns no diffs because the type has no trailog-tagged fields
+	//     (untagged structs should still be diffed field-by-field via JSON round-trip).
+	if err != nil || len(rawDiffs) == 0 {
 		bMap := toMap(before)
 		aMap := toMap(after)
-		jsonDiffs := diff.JSON(bMap, aMap)
-		rawDiffs = make([]diff.FieldDiff, len(jsonDiffs))
-		for i, d := range jsonDiffs {
-			rawDiffs[i] = diff.FieldDiff(d)
+		if len(bMap) > 0 || len(aMap) > 0 {
+			jsonDiffs := diff.JSON(bMap, aMap)
+			if len(jsonDiffs) > 0 {
+				rawDiffs = make([]diff.FieldDiff, len(jsonDiffs))
+				for i, d := range jsonDiffs {
+					rawDiffs[i] = diff.FieldDiff(d)
+				}
+			}
 		}
 	}
 
