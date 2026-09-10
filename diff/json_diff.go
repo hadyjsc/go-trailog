@@ -52,24 +52,28 @@ func jsonDiff(before, after map[string]any, prefix string) []FieldDiff {
 		bVal, bOk := before[key]
 		aVal, aOk := after[key]
 
-		// Field removed.
+		// Field removed — only record if the old value was non-nil (a real removal).
 		if bOk && !aOk {
-			diffs = append(diffs, FieldDiff{
-				Field:    fieldPath,
-				OldValue: bVal,
-				NewValue: nil,
-				Type:     inferType(bVal, nil),
-			})
+			if bVal != nil {
+				diffs = append(diffs, FieldDiff{
+					Field:    fieldPath,
+					OldValue: bVal,
+					NewValue: nil,
+					Type:     inferType(bVal, nil),
+				})
+			}
 			continue
 		}
-		// Field added.
+		// Field added — only record if the new value is non-nil (a real addition).
 		if !bOk && aOk {
-			diffs = append(diffs, FieldDiff{
-				Field:    fieldPath,
-				OldValue: nil,
-				NewValue: aVal,
-				Type:     inferType(nil, aVal),
-			})
+			if aVal != nil {
+				diffs = append(diffs, FieldDiff{
+					Field:    fieldPath,
+					OldValue: nil,
+					NewValue: aVal,
+					Type:     inferType(nil, aVal),
+				})
+			}
 			continue
 		}
 
