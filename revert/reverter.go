@@ -4,10 +4,13 @@
 package revert
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,13 +30,61 @@ const (
 	StrategyForceOverwrite Strategy = "force"
 )
 
+// ApplyMode controls whether the reverter writes data back to the application tables.
+type ApplyMode int
+
+const (
+	// ApplyModeWrite (default) — call repo.Save / repo.Delete / RevertApplier.
+	// Returns an error if no repository or applier is registered for the entity type.
+	ApplyModeWrite ApplyMode = iota
+	// ApplyModeSkip — only persist the audit revision; skip all application-table writes.
+	// Use this when the reverter is running inside a standalone audit service that has
+	// no access to the application's database schema.
+	ApplyModeSkip
+	// ApplyModeWebhook — POST the snapshot to an external URL supplied by the caller.
+	// Set via WithWebhookApplier. The standalone audit service uses this so the main
+	// application handles its own write logic.
+	ApplyModeWebhook
+)
+
+// WebhookTarget describes the external endpoint that should receive the revert payload.
+type WebhookTarget struct {
+	// URL is the endpoint of the main service, e.g. "http://localhost:3000/master/banks/:id".
+	// The literal ":id" placeholder (if present) is replaced with the entity ID at call time.
+	URL string `json:"url"`
+	// Method is the HTTP method to use: "POST", "PUT", or "PATCH" (default "POST").
+	Method string `json:"method"`
+	// Auth is sent as the Authorization header value verbatim (e.g. "Bearer <token>",
+	// "ApiKey <secret>", or just a raw secret key). Leave empty to send no auth header.
+	Auth string `json:"auth"`
+	// Timeout is the HTTP call timeout in seconds (default 30).
+	Timeout int `json:"timeout"`
+}
+
+// WebhookPayload is the body sent to the WebhookTarget URL.
+type WebhookPayload struct {
+	// RevisionID is the ID of the newly created revert revision in the audit store.
+	RevisionID string `json:"revision_id"`
+	// EntityType and EntityID identify the entity being reverted.
+	EntityType string `json:"entity_type"`
+	EntityID   string `json:"entity_id"`
+	// Op is the logical operation: "restore_update", "restore_create", or "restore_delete".
+	Op string `json:"op"`
+	// ToState is the snapshot the main service should write. Nil for restore_delete.
+	ToState map[string]any `json:"to_state,omitempty"`
+	// ChangedFields lists only the fields that differ between FromState and ToState.
+	ChangedFields []string `json:"changed_fields,omitempty"`
+}
+
 // RevertOption configures a revert call.
 type RevertOption func(*revertOptions)
 
 type revertOptions struct {
-	strategy Strategy
-	cascade  int // relation hops to cascade revert to related entities
-	reason   string
+	strategy      Strategy
+	cascade       int // relation hops to cascade revert to related entities
+	reason        string
+	applyMode     ApplyMode
+	webhookTarget *WebhookTarget
 }
 
 // WithStrategy sets the conflict-resolution strategy.
@@ -49,6 +100,25 @@ func WithCascade(depth int) RevertOption {
 // WithReason sets the reason/message stored on the new revert revision.
 func WithReason(msg string) RevertOption {
 	return func(o *revertOptions) { o.reason = msg }
+}
+
+// WithSkipApply puts the reverter into audit-only mode: the revert revision is
+// persisted in the audit store, but no writes are made to the application tables.
+// This is the correct mode when the reverter is running inside a standalone audit
+// service that has no registered EntityRepository or RevertApplier for the entity type.
+func WithSkipApply() RevertOption {
+	return func(o *revertOptions) { o.applyMode = ApplyModeSkip }
+}
+
+// WithWebhookApplier puts the reverter into webhook mode: after persisting the audit
+// revision it calls the target URL with a WebhookPayload so the main service can
+// execute its own write logic. The revert is considered successful when the webhook
+// returns HTTP 2xx; any other status or network error aborts the revert.
+func WithWebhookApplier(t WebhookTarget) RevertOption {
+	return func(o *revertOptions) {
+		o.applyMode = ApplyModeWebhook
+		o.webhookTarget = &t
+	}
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -79,6 +149,9 @@ type Conflict struct {
 	TargetValue  any
 	CurrentValue any
 	ChangedBy    []string // revision IDs that touched this field after the target
+	// Reason is a human-readable explanation. Set for structural conflicts
+	// (e.g. create-order violation); empty for ordinary field conflicts.
+	Reason string
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -94,14 +167,61 @@ type EntityRepository interface {
 	Delete(ctx context.Context, id string) error
 }
 
-// RepositoryRegistry maps entity types to their EntityRepository adapters.
+// RevertContext carries all the information the reverter has about a single
+// entity revert operation. It is passed to a RevertApplier so the caller can
+// translate the snapshot into a precise write against their own table schema.
+type RevertContext struct {
+	// EntityType and EntityID identify the row being reverted.
+	EntityType string
+	EntityID   string
+
+	// Op is the logical revert operation:
+	//   "restore_update" — undo an update, write ToState back.
+	//   "restore_create" — undo a delete, re-insert ToState.
+	//   "restore_delete" — undo a create, delete the row.
+	Op string
+
+	// FromState is the current snapshot stored in the audit log (the state
+	// the row is in right now, before the revert is applied).
+	FromState map[string]any
+
+	// ToState is the snapshot the reverter wants to apply. It reflects any
+	// conflict-resolution filtering (StrategyFieldLevel) already applied.
+	// For Op == "restore_delete" this will be nil.
+	ToState map[string]any
+
+	// ChangedFields contains the field names that are actually being reverted
+	// (i.e. the fields that differ between FromState and ToState after conflict
+	// filtering). Useful for building a targeted UPDATE SET clause.
+	ChangedFields []string
+}
+
+// RevertApplier is a callback that applies a revert operation to the real
+// application table. Register one per entity type via
+// RepositoryRegistry.RegisterApplier when the default repo.Save / repo.Delete
+// is not sufficient (e.g. different column names, required transformations,
+// extra audit columns that must be updated alongside the revert).
+//
+// The applier must return nil on success. Returning an error aborts the revert.
+//
+// If both a RevertApplier and an EntityRepository are registered for the same
+// entity type, the RevertApplier takes precedence for write operations; the
+// EntityRepository is still used for Load.
+type RevertApplier func(ctx context.Context, rc RevertContext) error
+
+// RepositoryRegistry maps entity types to their EntityRepository adapters
+// and optional RevertApplier callbacks.
 type RepositoryRegistry struct {
-	repos map[string]EntityRepository
+	repos    map[string]EntityRepository
+	appliers map[string]RevertApplier
 }
 
 // NewRepositoryRegistry creates an empty registry.
 func NewRepositoryRegistry() *RepositoryRegistry {
-	return &RepositoryRegistry{repos: make(map[string]EntityRepository)}
+	return &RepositoryRegistry{
+		repos:    make(map[string]EntityRepository),
+		appliers: make(map[string]RevertApplier),
+	}
 }
 
 // Register associates an entity type with its repository adapter.
@@ -109,9 +229,22 @@ func (r *RepositoryRegistry) Register(entityType string, repo EntityRepository) 
 	r.repos[entityType] = repo
 }
 
+// RegisterApplier registers a custom RevertApplier for an entity type.
+// The applier is called instead of repo.Save / repo.Delete when applying a
+// revert, giving the caller full control over how snapshot data maps to their
+// table schema.
+func (r *RepositoryRegistry) RegisterApplier(entityType string, fn RevertApplier) {
+	r.appliers[entityType] = fn
+}
+
 // Get returns the repository for an entity type, or nil if not registered.
 func (r *RepositoryRegistry) Get(entityType string) EntityRepository {
 	return r.repos[entityType]
+}
+
+// GetApplier returns the RevertApplier for an entity type, or nil if none is registered.
+func (r *RepositoryRegistry) GetApplier(entityType string) RevertApplier {
+	return r.appliers[entityType]
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -155,7 +288,40 @@ func (rv *Reverter) PreviewRevert(ctx context.Context, revisionID string, opts .
 			ToState:   ec.SnapshotBefore,
 		}
 
-		// Detect conflicts: fields changed after the target revision.
+		// If this entity was created in the target revision, check whether any
+		// later revisions have touched it. Reverting a create (which would delete
+		// the entity) is only safe when it is the most recent audit record —
+		// i.e. no updates or deletes have happened after the create. If later
+		// changes exist the caller must revert from the latest change backwards,
+		// one revision at a time, until they reach the create.
+		if ec.Op == "create" {
+			laterChanges, err := rv.store.GetEntityChanges(ctx, ec.EntityType, ec.EntityID)
+			if err != nil {
+				return nil, fmt.Errorf("trailog/revert: check later changes for %s:%s: %w", ec.EntityType, ec.EntityID, err)
+			}
+			// GetEntityChanges returns newest-first; any entry whose RevisionID differs
+			// from the target means the entity was touched after the create.
+			var laterRevIDs []string
+			for _, lc := range laterChanges {
+				if lc.RevisionID != revisionID {
+					laterRevIDs = append(laterRevIDs, lc.RevisionID)
+				}
+			}
+			if len(laterRevIDs) > 0 {
+				action.HasConflict = true
+				plan.Conflicts = append(plan.Conflicts, Conflict{
+					EntityType:   ec.EntityType,
+					EntityID:     ec.EntityID,
+					Field:        "*",
+					TargetValue:  nil,
+					CurrentValue: current,
+					ChangedBy:    laterRevIDs,
+					Reason:       fmt.Sprintf("cannot revert create for %s:%s — %d later revision(s) exist; revert from the most recent change first", ec.EntityType, ec.EntityID, len(laterRevIDs)),
+				})
+			}
+		}
+
+		// Detect field-level conflicts: fields changed after the target revision.
 		conflicts, err := rv.detectConflicts(ctx, ec, target.OccurredAt)
 		if err != nil {
 			return nil, err
@@ -183,6 +349,15 @@ func (rv *Reverter) RevertRevision(ctx context.Context, revisionID string, opts 
 	if len(plan.Conflicts) > 0 && o.strategy == StrategyBlockOnConflict {
 		return nil, fmt.Errorf("trailog/revert: %d conflict(s) found — use WithStrategy(StrategyFieldLevel) or StrategyForceOverwrite to proceed: %v",
 			len(plan.Conflicts), conflictSummary(plan.Conflicts))
+	}
+
+	// Create-order conflicts (Field == "*") are structural and can never be
+	// bypassed — even StrategyForceOverwrite cannot delete an entity that has
+	// later audit records, because that would silently orphan audit history.
+	for _, c := range plan.Conflicts {
+		if c.Field == "*" {
+			return nil, fmt.Errorf("trailog/revert: %s", c.Reason)
+		}
 	}
 
 	// Topologically sort entities so FK-safe write order is guaranteed.
@@ -213,26 +388,14 @@ func (rv *Reverter) RevertRevision(ctx context.Context, revisionID string, opts 
 			continue
 		}
 
-		repo := rv.repos.Get(e.Type)
-		if repo == nil {
-			return nil, fmt.Errorf("trailog/revert: no repository registered for entity type %q — register one with WithRepository", e.Type)
-		}
-
 		toState := action.ToState
 		if o.strategy == StrategyFieldLevel && action.HasConflict {
 			// Only restore fields not touched since target revision.
 			toState = filterUntouched(action.ToState, action.FromState, plan.Conflicts, e.Type, e.ID)
 		}
 
-		var applyErr error
-		switch action.Op {
-		case "restore_delete": // undo a create → delete the row
-			applyErr = repo.Delete(ctx, e.ID)
-		case "restore_create", "restore_update": // undo a delete/update → save old state
-			applyErr = repo.Save(ctx, e.ID, toState)
-		}
-		if applyErr != nil {
-			return nil, fmt.Errorf("trailog/revert: apply %s on %s:%s: %w", action.Op, e.Type, e.ID, applyErr)
+		if err := rv.applyRevert(ctx, e.Type, e.ID, action.Op, action.FromState, toState, o.applyMode, o.webhookTarget, newRevID); err != nil {
+			return nil, err
 		}
 
 		ecID := uuid.New().String()
@@ -297,14 +460,29 @@ func (rv *Reverter) RevertEntity(ctx context.Context, entityType, entityID, toRe
 		return nil, fmt.Errorf("trailog/revert: entity %s:%s not found in revision %s", entityType, entityID, toRevisionID)
 	}
 
-	repo := rv.repos.Get(entityType)
-	if repo == nil {
-		return nil, fmt.Errorf("trailog/revert: no repository registered for entity type %q", entityType)
-	}
-
 	current, err := rv.store.LatestSnapshot(ctx, entityType, entityID)
 	if err != nil {
 		return nil, err
+	}
+
+	// Guard: if the target change is a create, block revert when later changes exist.
+	if targetEC.Op == "create" {
+		laterChanges, err := rv.store.GetEntityChanges(ctx, entityType, entityID)
+		if err != nil {
+			return nil, fmt.Errorf("trailog/revert: check later changes for %s:%s: %w", entityType, entityID, err)
+		}
+		var laterRevIDs []string
+		for _, lc := range laterChanges {
+			if lc.RevisionID != toRevisionID {
+				laterRevIDs = append(laterRevIDs, lc.RevisionID)
+			}
+		}
+		if len(laterRevIDs) > 0 {
+			return nil, fmt.Errorf(
+				"trailog/revert: cannot revert create for %s:%s — %d later revision(s) exist; revert from the most recent change first",
+				entityType, entityID, len(laterRevIDs),
+			)
+		}
 	}
 
 	toState := targetEC.SnapshotBefore
@@ -318,11 +496,11 @@ func (rv *Reverter) RevertEntity(ctx context.Context, entityType, entityID, toRe
 		}
 	}
 
-	if err := repo.Save(ctx, entityID, toState); err != nil {
-		return nil, fmt.Errorf("trailog/revert: save entity: %w", err)
-	}
-
 	newRevID := uuid.New().String()
+
+	if err := rv.applyRevert(ctx, entityType, entityID, inverseOp(targetEC.Op), current, toState, o.applyMode, o.webhookTarget, newRevID); err != nil {
+		return nil, err
+	}
 	reason := o.reason
 	if reason == "" {
 		reason = fmt.Sprintf("Reverted %s:%s to state at revision %s", entityType, entityID, toRevisionID)
@@ -366,6 +544,134 @@ func (rv *Reverter) RevertEntity(ctx context.Context, entityType, entityID, toRe
 // ────────────────────────────────────────────────────────────────
 // helpers
 // ────────────────────────────────────────────────────────────────
+
+// applyRevert dispatches a single entity revert write. Precedence:
+//
+//  1. ApplyModeSkip                                     → no-op (audit-only)
+//  2. ApplyModeWebhook                                  → POST WebhookPayload to target URL
+//  3. RevertApplier registered for the entity type      → called with full RevertContext
+//  4. EntityRepository registered for the entity type   → Save / Delete called directly
+//  5. Neither registered                                → error
+func (rv *Reverter) applyRevert(ctx context.Context, entityType, entityID, op string, fromState, toState map[string]any, mode ApplyMode, webhook *WebhookTarget, revisionID string) error {
+	// Audit-only mode: skip all application-table writes.
+	if mode == ApplyModeSkip {
+		return nil
+	}
+
+	// Webhook mode: call the main service's API with the snapshot payload.
+	if mode == ApplyModeWebhook {
+		if webhook == nil {
+			return fmt.Errorf("trailog/revert: webhook mode selected but no WebhookTarget provided")
+		}
+		return rv.callWebhook(ctx, webhook, WebhookPayload{
+			RevisionID:    revisionID,
+			EntityType:    entityType,
+			EntityID:      entityID,
+			Op:            op,
+			ToState:       toState,
+			ChangedFields: changedFields(fromState, toState),
+		})
+	}
+
+	applier := rv.repos.GetApplier(entityType)
+	if applier != nil {
+		rc := RevertContext{
+			EntityType:    entityType,
+			EntityID:      entityID,
+			Op:            op,
+			FromState:     fromState,
+			ToState:       toState,
+			ChangedFields: changedFields(fromState, toState),
+		}
+		if err := applier(ctx, rc); err != nil {
+			return fmt.Errorf("trailog/revert: applier for %s:%s (%s): %w", entityType, entityID, op, err)
+		}
+		return nil
+	}
+
+	repo := rv.repos.Get(entityType)
+	if repo == nil {
+		return fmt.Errorf("trailog/revert: no repository or applier registered for entity type %q — register one with WithRepository or WithRevertApplier", entityType)
+	}
+
+	var err error
+	switch op {
+	case "restore_delete": // undo a create → delete the row
+		err = repo.Delete(ctx, entityID)
+	case "restore_create", "restore_update": // undo a delete/update → write old state
+		err = repo.Save(ctx, entityID, toState)
+	}
+	if err != nil {
+		return fmt.Errorf("trailog/revert: apply %s on %s:%s: %w", op, entityType, entityID, err)
+	}
+	return nil
+}
+
+// callWebhook sends a WebhookPayload to the target URL and returns an error if
+// the response is not HTTP 2xx or the request fails.
+func (rv *Reverter) callWebhook(ctx context.Context, target *WebhookTarget, payload WebhookPayload) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("trailog/revert: marshal webhook payload: %w", err)
+	}
+
+	// Replace ":id" placeholder in URL with the actual entity ID.
+	url := strings.ReplaceAll(target.URL, ":id", payload.EntityID)
+
+	method := strings.ToUpper(target.Method)
+	if method == "" {
+		method = http.MethodPost
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("trailog/revert: build webhook request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if target.Auth != "" {
+		req.Header.Set("Authorization", target.Auth)
+	}
+
+	timeout := time.Duration(target.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	client := &http.Client{Timeout: timeout}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("trailog/revert: webhook call to %s failed: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("trailog/revert: webhook %s returned non-2xx status %d", url, resp.StatusCode)
+	}
+	return nil
+}
+
+// changedFields returns the field names that differ between fromState and toState.
+// Used to populate RevertContext.ChangedFields so appliers can build targeted UPDATE queries.
+func changedFields(from, to map[string]any) []string {
+	if to == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var fields []string
+	add := func(k string) {
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			fields = append(fields, k)
+		}
+	}
+	for k, toVal := range to {
+		fromVal, exists := from[k]
+		if !exists || fmt.Sprintf("%v", fromVal) != fmt.Sprintf("%v", toVal) {
+			add(k)
+		}
+	}
+	return fields
+}
 
 func applyOpts(opts []RevertOption) *revertOptions {
 	o := &revertOptions{strategy: StrategyBlockOnConflict}

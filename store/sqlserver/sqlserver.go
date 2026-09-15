@@ -148,6 +148,169 @@ func (s *Store) SaveRevision(ctx context.Context, rev store.Revision) error {
 	return nil
 }
 
+// ListEntities returns a paginated list of distinct (entity_type, entity_id) pairs
+// enriched with metadata from their most recent audit change.
+func (s *Store) ListEntities(ctx context.Context, f store.ListEntitiesFilter) (*store.ListEntitiesResult, error) {
+	limit := f.Limit
+	if limit <= 0 || limit > 200 {
+		limit = 20
+	}
+
+	sortCol := "last_changed_at"
+	switch f.SortField {
+	case "entity_type":
+		sortCol = "entity_type"
+	case "entity_id":
+		sortCol = "entity_id"
+	}
+	sortDir := "DESC"
+	if strings.ToLower(f.SortDir) == "asc" {
+		sortDir = "ASC"
+	}
+
+	args := []any{}
+	var conds []string
+	n := 1
+
+	if f.EntityType != "" {
+		conds = append(conds, fmt.Sprintf("ec.entity_type = @p%d", n))
+		args = append(args, f.EntityType)
+		n++
+	}
+	if f.ActorID != "" {
+		conds = append(conds, fmt.Sprintf("r.actor_id = @p%d", n))
+		args = append(args, f.ActorID)
+		n++
+	}
+	if f.Op != "" {
+		conds = append(conds, fmt.Sprintf("ec.op = @p%d", n))
+		args = append(args, f.Op)
+		n++
+	}
+	if !f.From.IsZero() {
+		conds = append(conds, fmt.Sprintf("r.occurred_at >= @p%d", n))
+		args = append(args, f.From.UTC())
+		n++
+	}
+	if !f.To.IsZero() {
+		conds = append(conds, fmt.Sprintf("r.occurred_at <= @p%d", n))
+		args = append(args, f.To.UTC())
+		n++
+	}
+
+	where := ""
+	if len(conds) > 0 {
+		where = "WHERE " + strings.Join(conds, " AND ")
+	}
+
+	countQ := fmt.Sprintf(`
+		SELECT COUNT(*) FROM (
+			SELECT ec.entity_type, ec.entity_id
+			FROM audit_entity_change ec
+			JOIN audit_revision r ON r.id = ec.revision_id
+			%s
+			GROUP BY ec.entity_type, ec.entity_id
+		) sub`, where)
+	var total int
+	if err := s.db.QueryRowContext(ctx, countQ, args...).Scan(&total); err != nil {
+		return nil, fmt.Errorf("trailog/store/sqlserver: list entities count: %w", err)
+	}
+
+	outerConds := []string{}
+	if f.Cursor != "" {
+		parts := strings.SplitN(f.Cursor, "|", 2)
+		if len(parts) == 2 {
+			cursorTime, err := time.Parse(time.RFC3339Nano, parts[0])
+			cursorID := parts[1]
+			if err == nil {
+				if sortDir == "ASC" {
+					outerConds = append(outerConds, fmt.Sprintf(
+						"(last_changed_at > @p%d OR (last_changed_at = @p%d AND entity_id > @p%d))",
+						n, n+1, n+2))
+				} else {
+					outerConds = append(outerConds, fmt.Sprintf(
+						"(last_changed_at < @p%d OR (last_changed_at = @p%d AND entity_id > @p%d))",
+						n, n+1, n+2))
+				}
+				args = append(args, cursorTime.UTC(), cursorTime.UTC(), cursorID)
+				n += 3
+			}
+		}
+	}
+	outerWhere := ""
+	if len(outerConds) > 0 {
+		outerWhere = "WHERE " + strings.Join(outerConds, " AND ")
+	}
+
+	args = append(args, limit)
+	// SQL Server: FIRST_VALUE for latest-row values; TOP for limit.
+	mainQ := fmt.Sprintf(`
+		SELECT entity_type, entity_id, last_changed_at, last_op, last_actor_id, last_actor_name, revision_count
+		FROM (
+			SELECT
+				ec.entity_type,
+				ec.entity_id,
+				MAX(r.occurred_at) AS last_changed_at,
+				COUNT(DISTINCT r.id) AS revision_count,
+				FIRST_VALUE(ec.op) OVER (
+					PARTITION BY ec.entity_type, ec.entity_id
+					ORDER BY r.occurred_at DESC
+					ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+				) AS last_op,
+				FIRST_VALUE(r.actor_id) OVER (
+					PARTITION BY ec.entity_type, ec.entity_id
+					ORDER BY r.occurred_at DESC
+					ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+				) AS last_actor_id,
+				FIRST_VALUE(r.actor_name) OVER (
+					PARTITION BY ec.entity_type, ec.entity_id
+					ORDER BY r.occurred_at DESC
+					ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+				) AS last_actor_name
+			FROM audit_entity_change ec
+			JOIN audit_revision r ON r.id = ec.revision_id
+			%s
+			GROUP BY ec.entity_type, ec.entity_id
+		) sub
+		%s
+		ORDER BY %s %s, entity_id ASC
+		OFFSET 0 ROWS FETCH NEXT @p%d ROWS ONLY`, where, outerWhere, sortCol, sortDir, n)
+
+	rows, err := s.db.QueryContext(ctx, mainQ, args...)
+	if err != nil {
+		return nil, fmt.Errorf("trailog/store/sqlserver: list entities: %w", err)
+	}
+	defer rows.Close()
+
+	var entities []store.EntitySummary
+	for rows.Next() {
+		var e store.EntitySummary
+		var lastActorID, lastActorName sql.NullString
+		if err := rows.Scan(&e.EntityType, &e.EntityID, &e.LastChangedAt,
+			&e.LastOp, &lastActorID, &lastActorName, &e.RevisionCount); err != nil {
+			return nil, fmt.Errorf("trailog/store/sqlserver: scan entity summary: %w", err)
+		}
+		e.LastActorID = lastActorID.String
+		e.LastActorName = lastActorName.String
+		entities = append(entities, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	nextCursor := ""
+	if len(entities) == limit && limit > 0 {
+		last := entities[len(entities)-1]
+		nextCursor = last.LastChangedAt.UTC().Format(time.RFC3339Nano) + "|" + last.EntityID
+	}
+
+	return &store.ListEntitiesResult{
+		Entities:   entities,
+		NextCursor: nextCursor,
+		Total:      total,
+	}, nil
+}
+
 // GetRevision returns the full Revision with all EntityChanges and FieldDiffs.
 func (s *Store) GetRevision(ctx context.Context, id string) (*store.Revision, error) {
 	const q = `

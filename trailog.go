@@ -94,6 +94,7 @@ type config struct {
 	useAsync     bool
 	relations    []relationConfig
 	repos        map[string]revert.EntityRepository
+	appliers     map[string]revert.RevertApplier
 }
 
 type relationConfig struct {
@@ -179,6 +180,45 @@ func WithRepository(entityType string, repo revert.EntityRepository) TrailogOpti
 			c.repos = make(map[string]revert.EntityRepository)
 		}
 		c.repos[entityType] = repo
+		return nil
+	}
+}
+
+// WithRevertApplier registers a custom RevertApplier callback for an entity type.
+// Use this when the default repo.Save / repo.Delete path is not sufficient — for
+// example when your table schema uses different column names, requires extra
+// columns to be updated (e.g. updated_at, updated_by), or needs a transformation
+// between the snapshot map and the actual DB columns.
+//
+// The applier receives a RevertContext with:
+//   - Op            — "restore_update", "restore_create", or "restore_delete"
+//   - FromState     — the current snapshot (before applying the revert)
+//   - ToState       — the snapshot to restore (after conflict filtering)
+//   - ChangedFields — field names that actually differ between From and To
+//
+// If both a WithRepository and a WithRevertApplier are registered for the same
+// entity type, the applier takes precedence for write operations; the repository
+// is still used for Load calls (e.g. when building conflict previews).
+//
+// Example:
+//
+//	trailog.WithRevertApplier("bank", func(ctx context.Context, rc revert.RevertContext) error {
+//	    switch rc.Op {
+//	    case "restore_delete":
+//	        return db.ExecContext(ctx, "DELETE FROM banks WHERE id = ?", rc.EntityID)
+//	    default:
+//	        return db.ExecContext(ctx,
+//	            "UPDATE banks SET name=?, swift_code=?, updated_by=? WHERE id=?",
+//	            rc.ToState["name"], rc.ToState["swiftCode"], "system_revert", rc.EntityID,
+//	        )
+//	    }
+//	})
+func WithRevertApplier(entityType string, fn revert.RevertApplier) TrailogOption {
+	return func(c *config) error {
+		if c.appliers == nil {
+			c.appliers = make(map[string]revert.RevertApplier)
+		}
+		c.appliers[entityType] = fn
 		return nil
 	}
 }
@@ -288,6 +328,9 @@ func New(opts ...TrailogOption) (*Trailog, error) {
 	repos := revert.NewRepositoryRegistry()
 	for entityType, repo := range c.repos {
 		repos.Register(entityType, repo)
+	}
+	for entityType, fn := range c.appliers {
+		repos.RegisterApplier(entityType, fn)
 	}
 
 	var disp dispatcher

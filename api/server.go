@@ -39,20 +39,32 @@ func DefaultServerConfig() ServerConfig {
 // NewServer constructs a Server with all routes registered.
 // actorExtractor may be nil — in that case requests are served without actor injection
 // (useful when the embedding app handles auth at a higher level).
+// handlerOpts are applied to the Handler — use WithAuditOnlyRevert() when no
+// EntityRepository or RevertApplier is registered for the entity types.
 func NewServer(
 	cfg ServerConfig,
 	tl *timeline.Service,
 	rv *revert.Reverter,
 	actorExtractor httpmw.ActorExtractor,
+	handlerOpts ...HandlerOption,
 ) *Server {
-	h := NewHandler(tl, rv)
+	h := NewHandler(tl, rv, handlerOpts...)
 	mux := http.NewServeMux()
 
 	// ── Routes ──────────────────────────────────────────────────
 	// Health check — no auth needed.
 	mux.HandleFunc("/health", HealthCheck)
 
-	// Entity timeline & related queries.
+	// Entity list (no type/id) — GET /entities
+	mux.HandleFunc("/entities", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		h.GetEntities(w, r)
+	})
+
+	// Entity timeline & related queries — /entities/{type}/{id}/...
 	mux.HandleFunc("/entities/", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {

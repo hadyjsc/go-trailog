@@ -548,6 +548,28 @@ type Invoice struct {
 
 Fields without a tag are skipped unless they are nested structs (which are recursed into with dot-path notation: `address.city`).
 
+### Untagged structs and plain maps
+
+If you pass a struct with **no** `trailog:"track"` tags, or a `map[string]any` directly, the differ automatically falls back to a JSON-based field diff. Every key present in either snapshot is compared by value — so you get full field-level diffs without adding any tags:
+
+```go
+// Works — map[string]any, no tags needed
+before := map[string]any{"name": "PT. Bank Habib Syariah.", "swiftCode": "PTXXX03", "status": "ACTIVE"}
+after  := map[string]any{"name": "PT. Bank Syariah Habib.", "swiftCode": "PTXXX03", "status": "ACTIVE"}
+
+err = tl.Recorder().RecordUpdate(ctx,
+    trailog.Entity{Type: "bank", ID: "HES0003"},
+    before, after,
+)
+// Stored diff: [{field:"name", old:"PT. Bank Habib Syariah.", new:"PT. Bank Syariah Habib."}]
+```
+
+**Fallback priority:**
+1. `diff.Struct` — used when the input is a tagged struct; only `trailog:"track"` and `trailog:"mask"` fields are diffed.
+2. `diff.JSON` — used when the input is a `map[string]any`, a non-struct type, or a struct with no tagged fields. All keys are compared by value; fields whose values are equal are skipped; fields added or removed with a `nil` value produce no noise entry.
+
+> **Note on `update` no-op skip:** if the computed diff is empty (nothing actually changed), `RecordUpdate` returns `nil` without writing any revision — this prevents noise in the audit log.
+
 ---
 
 ## 13. Relations & timeline queries
@@ -614,7 +636,20 @@ newRev, err := tl.Reverter().RevertRevision(ctx, revisionID,
 
 Revert always creates a **new** revision (git-revert semantics) — history is never silently rewritten.
 
-For revert to write data back to your tables, register an `EntityRepository` per entity type:
+### Create-order guard
+
+Reverting a `create` revision when later changes exist is always blocked, regardless of strategy. The entity must be reverted in reverse chronological order — from the most recent change backwards — until the create is the only remaining record, at which point reverting it issues a delete.
+
+```
+// Attempting to revert the original create when 2 updates follow it:
+plan.Conflicts[0].Field   = "*"
+plan.Conflicts[0].Reason  = "cannot revert create for bank:HES0003 — 2 later revision(s) exist;
+                              revert from the most recent change first"
+```
+
+### Registering a repository (default write path)
+
+For revert to write data back to your tables, register an `EntityRepository` per entity type. The reverter calls `Save` with the full snapshot map and `Delete` when undoing a create.
 
 ```go
 trailog.WithRepository("order", orderRepoAdapter{db})
@@ -627,6 +662,126 @@ func (a orderRepoAdapter) Load(ctx context.Context, id string) (map[string]any, 
 func (a orderRepoAdapter) Save(ctx context.Context, id string, data map[string]any) error { … }
 func (a orderRepoAdapter) Delete(ctx context.Context, id string) error { … }
 ```
+
+### Custom revert applier (schema mismatch / column mapping)
+
+When the snapshot map keys don't match your table's column names — or you need to set extra columns like `updated_at`, `updated_by`, or run a transformation — register a `RevertApplier` instead. The applier takes precedence over `repo.Save`/`repo.Delete` for write operations; `Load` still goes through the `EntityRepository`.
+
+```go
+tl, err := trailog.New(
+    trailog.WithPostgresStore(dsn),
+    trailog.WithRepository("bank", bankRepo{db}),       // Load() used for conflict detection
+    trailog.WithRevertApplier("bank", func(ctx context.Context, rc revert.RevertContext) error {
+        switch rc.Op {
+        case "restore_delete":
+            _, err := db.ExecContext(ctx, "DELETE FROM banks WHERE id = $1", rc.EntityID)
+            return err
+        default:
+            // rc.ToState keys come from the stored snapshot — map them to real column names here.
+            // rc.ChangedFields lists only the keys that actually differ (useful for partial UPDATEs).
+            _, err := db.ExecContext(ctx,
+                `UPDATE banks SET name=$1, swift_code=$2, status=$3, updated_by=$4 WHERE id=$5`,
+                rc.ToState["name"],
+                rc.ToState["swiftCode"],   // snapshot key → column swift_code
+                rc.ToState["status"],
+                "system_revert",           // extra column not in snapshot
+                rc.EntityID,
+            )
+            return err
+        }
+    }),
+)
+```
+
+**`RevertContext` fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `EntityType` | `string` | Entity type being reverted |
+| `EntityID` | `string` | Entity ID being reverted |
+| `Op` | `string` | `"restore_update"` \| `"restore_create"` \| `"restore_delete"` |
+| `FromState` | `map[string]any` | Current snapshot (before the revert is applied) |
+| `ToState` | `map[string]any` | Snapshot to restore (after conflict filtering); `nil` for `restore_delete` |
+| `ChangedFields` | `[]string` | Field names that differ between `FromState` and `ToState` |
+
+You can also register an applier after startup via the registry:
+
+```go
+tl.Repos().RegisterApplier("bank", myApplierFunc)
+```
+
+### Webhook applier (standalone service mode)
+
+When the audit service runs standalone — with no access to the application's database — supply a `target` in the revert request body. The reverter will `POST` the snapshot directly to your main service's API instead of writing to the database itself.
+
+This is the recommended pattern when trailog is deployed as a separate microservice.
+
+**Via the HTTP API** (`POST /revisions/{id}/revert`):
+
+```json
+{
+  "target": {
+    "url":     "http://localhost:3000/master/banks/:id",
+    "method":  "PUT",
+    "auth":    "Bearer secret-key",
+    "timeout": 30
+  },
+  "strategy": "field_level",
+  "reason":   "rolling back incorrect name change"
+}
+```
+
+The `:id` placeholder in `url` is replaced with the actual entity ID at call time.
+
+**Via the Go library**:
+
+```go
+newRev, err := tl.Reverter().RevertRevision(ctx, revisionID,
+    revert.WithWebhookApplier(revert.WebhookTarget{
+        URL:    "http://localhost:3000/master/banks/:id",
+        Method: "PUT",
+        Auth:   "Bearer secret-key",
+    }),
+    revert.WithReason("rolling back incorrect name change"),
+)
+```
+
+**Payload sent to your endpoint** (`WebhookPayload`):
+
+```json
+{
+  "revision_id":    "new-revert-revision-uuid",
+  "entity_type":    "bank",
+  "entity_id":      "HES0003",
+  "op":             "restore_update",
+  "to_state":       { "name": "PT. Bank Habib Syariah.", "swiftCode": "PTXXX03", "status": "ACTIVE" },
+  "changed_fields": ["name"]
+}
+```
+
+Your endpoint must return HTTP `2xx`. Any other status or network failure aborts the revert (the audit revision is not saved).
+
+**Apply mode priority** (highest wins):
+
+| Condition | Write behaviour |
+|---|---|
+| `target` supplied in request body | Webhook — your main service handles the write |
+| Standalone server, no `target` | Audit-only — only the audit revision is saved |
+| Embedded with `WithRevertApplier` | Custom Go callback |
+| Embedded with `WithRepository` | `repo.Save` / `repo.Delete` |
+
+### Audit-only mode (no application-table writes)
+
+Use `WithSkipApply()` when you want the revert revision recorded in the audit log but do not want any application table touched (e.g. you handle the write separately):
+
+```go
+newRev, err := tl.Reverter().RevertRevision(ctx, revisionID,
+    revert.WithSkipApply(),
+    revert.WithReason("audit record only"),
+)
+```
+
+The standalone HTTP server uses this automatically when no `target` is provided in the request body.
 
 ---
 
@@ -679,19 +834,106 @@ POST /revisions/{id}/revert/preview
 
 Returns a `RevertPlan` with `actions` and `conflicts` — no data is written.
 
+A conflict with `field: "*"` means the create-order guard triggered; the entity has later revisions and cannot be reverted until those are unwound first.
+
 ### Execute revert
 
 ```
 POST /revisions/{id}/revert
 Content-Type: application/json
+```
 
+**Minimal body (audit-only — standalone server, no application write):**
+
+```json
 {
-  "strategy": "field_level",   // "block" | "field_level" | "force"
+  "strategy": "field_level",
   "reason":   "rolling back bad deploy"
 }
 ```
 
+**With webhook target (recommended for standalone service):**
+
+```json
+{
+  "target": {
+    "url":     "http://localhost:3000/master/banks/:id",
+    "method":  "PUT",
+    "auth":    "Bearer secret-key",
+    "timeout": 30
+  },
+  "strategy": "field_level",
+  "reason":   "rolling back incorrect name change"
+}
+```
+
+`target` fields:
+
+| Field | Required | Description |
+|---|---|---|
+| `url` | ✅ | Endpoint on your main service. `:id` is replaced with the entity ID. |
+| `method` | | HTTP method: `POST`, `PUT`, or `PATCH` (default `POST`) |
+| `auth` | | Sent verbatim as the `Authorization` header |
+| `timeout` | | Request timeout in seconds (default 30) |
+
+When `target` is provided the reverter `POST`s a `WebhookPayload` to your endpoint for each entity in the revision. Your endpoint must return `2xx`; any other status aborts the revert.
+
+`WebhookPayload` shape sent to your endpoint:
+
+```json
+{
+  "revision_id":    "new-revert-revision-uuid",
+  "entity_type":    "bank",
+  "entity_id":      "HES0003",
+  "op":             "restore_update",
+  "to_state":       { "name": "PT. Bank Habib Syariah.", "swiftCode": "PTXXX03" },
+  "changed_fields": ["name"]
+}
+```
+
 Returns the new revert `Revision`. HTTP 409 if strategy is `block` and conflicts exist.
+
+### Entity list
+
+```
+GET /entities
+```
+
+Returns all distinct (entity\_type, entity\_id) pairs that have at least one audit record.
+
+Query params:
+
+| Param | Type | Description |
+|---|---|---|
+| `entity_type` | string | Filter to one entity type |
+| `actor_id` | string | Filter by actor who last changed the entity |
+| `op` | string | Filter by last op: `create` \| `update` \| `delete` |
+| `from` | RFC3339 | `last_changed_at >= from` |
+| `to` | RFC3339 | `last_changed_at <= to` |
+| `sort` | string | `last_changed_at` (default) \| `entity_type` \| `entity_id` |
+| `dir` | string | `desc` (default) \| `asc` |
+| `limit` | int | Page size (default 20, max 200) |
+| `cursor` | string | Opaque cursor from previous `next_cursor` |
+
+Response:
+
+```json
+{
+  "entities": [
+    {
+      "entity_type":     "bank",
+      "entity_id":       "HES0003",
+      "last_changed_at": "2026-09-10T08:00:00Z",
+      "last_op":         "update",
+      "last_actor_id":   "user-42",
+      "last_actor_name": "Alice",
+      "revision_count":  3
+    }
+  ],
+  "next_cursor": "2026-09-10T08:00:00.000000000Z|HES0003",
+  "total": 42
+}
+```
 
 ### Health check
 
@@ -799,7 +1041,7 @@ trailog/
 │   └── group.go            # API view models
 │
 ├── revert/
-│   └── reverter.go         # PreviewRevert, RevertRevision, RevertEntity
+│   └── reverter.go         # PreviewRevert, RevertRevision, RevertEntity, RevertApplier callback
 │
 ├── api/
 │   ├── handler.go          # HTTP handlers for all 7 API endpoints

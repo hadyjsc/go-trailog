@@ -59,6 +59,48 @@ type RevertLog struct {
 	ConflictDetail   map[string]any
 }
 
+// ListEntitiesFilter parameterises a call to ListEntities.
+type ListEntitiesFilter struct {
+	// Narrow by entity type (exact match). Empty = all types.
+	EntityType string
+	// Narrow by actor that last touched the entity.
+	ActorID string
+	// Narrow by the op that last touched the entity: "create", "update", "delete".
+	Op string
+	// Time range applied to the latest change's occurred_at.
+	From time.Time
+	To   time.Time
+
+	// SortField controls the ORDER BY column.
+	// Allowed values: "entity_type" | "entity_id" | "last_changed_at" (default).
+	SortField string
+	// SortDir is "asc" or "desc" (default "desc").
+	SortDir string
+
+	// Cursor-based pagination. Pass the cursor returned in the previous response.
+	Limit  int
+	Cursor string // opaque — encodes "<last_occurred_at>|<last_entity_id>"
+}
+
+// EntitySummary is one row returned by ListEntities: the distinct entity plus
+// metadata from its most recent audit record.
+type EntitySummary struct {
+	EntityType    string    `json:"entity_type"`
+	EntityID      string    `json:"entity_id"`
+	LastChangedAt time.Time `json:"last_changed_at"`
+	LastOp        string    `json:"last_op"`
+	LastActorID   string    `json:"last_actor_id"`
+	LastActorName string    `json:"last_actor_name"`
+	RevisionCount int       `json:"revision_count"`
+}
+
+// ListEntitiesResult is the paginated response from ListEntities.
+type ListEntitiesResult struct {
+	Entities   []EntitySummary `json:"entities"`
+	NextCursor string          `json:"next_cursor,omitempty"`
+	Total      int             `json:"total"` // total matching rows (unpaged)
+}
+
 // TimelineFilter parameterises a timeline query.
 type TimelineFilter struct {
 	EntityType     string
@@ -82,6 +124,11 @@ type EntityRef struct {
 // Store is the persistence interface every storage backend must implement.
 // All methods are expected to be goroutine-safe.
 type Store interface {
+	// ListEntities returns a paginated list of distinct (entity_type, entity_id) pairs
+	// that have at least one audit record, enriched with metadata from the most recent
+	// change. Supports filtering, sorting, and cursor-based pagination.
+	ListEntities(ctx context.Context, f ListEntitiesFilter) (*ListEntitiesResult, error)
+
 	// SaveRevision persists a full Revision with all its EntityChanges,
 	// FieldDiffs, and optionally a RevertLog row, in one atomic operation.
 	SaveRevision(ctx context.Context, rev Revision) error

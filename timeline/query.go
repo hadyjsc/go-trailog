@@ -31,6 +31,42 @@ type TimelineQuery struct {
 	Cursor         string // cursor-based pagination — last revision ID from prior page
 }
 
+// EntityQuery parameterises a call to ListEntities.
+type EntityQuery struct {
+	// Filter
+	EntityType string    // narrow to one entity type; empty = all
+	ActorID    string    // narrow to entities last touched by this actor
+	Op         string    // narrow by last op: "create" | "update" | "delete"
+	From       time.Time // last_changed_at >= From
+	To         time.Time // last_changed_at <= To
+
+	// Sort
+	SortField string // "last_changed_at" (default) | "entity_type" | "entity_id"
+	SortDir   string // "desc" (default) | "asc"
+
+	// Pagination
+	Limit  int
+	Cursor string // opaque cursor from previous EntityResult.NextCursor
+}
+
+// EntityResult is the paginated response from ListEntities.
+type EntityResult struct {
+	Entities   []EntitySummary `json:"entities"`
+	NextCursor string          `json:"next_cursor,omitempty"`
+	Total      int             `json:"total"`
+}
+
+// EntitySummary is one row in EntityResult.
+type EntitySummary struct {
+	EntityType    string    `json:"entity_type"`
+	EntityID      string    `json:"entity_id"`
+	LastChangedAt time.Time `json:"last_changed_at"`
+	LastOp        string    `json:"last_op"`
+	LastActorID   string    `json:"last_actor_id"`
+	LastActorName string    `json:"last_actor_name"`
+	RevisionCount int       `json:"revision_count"`
+}
+
 // TimelineResult is the paginated response from GetTimeline.
 type TimelineResult struct {
 	Revisions  []Revision `json:"revisions"`
@@ -140,6 +176,48 @@ func (svc *Service) Snapshot(ctx context.Context, entity Entity, atRevisionID st
 		return nil, fmt.Errorf("trailog/timeline: entity %s:%s not found in revision %s", entity.Type, entity.ID, atRevisionID)
 	}
 	return snap, nil
+}
+
+// ListEntities returns a paginated, sorted, filtered list of every distinct
+// (entity_type, entity_id) pair that has at least one audit record, enriched
+// with metadata from the most recent change.
+func (svc *Service) ListEntities(ctx context.Context, q EntityQuery) (*EntityResult, error) {
+	limit := q.Limit
+	if limit <= 0 || limit > 200 {
+		limit = 20
+	}
+	f := store.ListEntitiesFilter{
+		EntityType: q.EntityType,
+		ActorID:    q.ActorID,
+		Op:         q.Op,
+		From:       q.From,
+		To:         q.To,
+		SortField:  q.SortField,
+		SortDir:    q.SortDir,
+		Limit:      limit,
+		Cursor:     q.Cursor,
+	}
+	res, err := svc.store.ListEntities(ctx, f)
+	if err != nil {
+		return nil, fmt.Errorf("trailog/timeline: list entities: %w", err)
+	}
+	out := &EntityResult{
+		NextCursor: res.NextCursor,
+		Total:      res.Total,
+		Entities:   make([]EntitySummary, len(res.Entities)),
+	}
+	for i, e := range res.Entities {
+		out.Entities[i] = EntitySummary{
+			EntityType:    e.EntityType,
+			EntityID:      e.EntityID,
+			LastChangedAt: e.LastChangedAt,
+			LastOp:        e.LastOp,
+			LastActorID:   e.LastActorID,
+			LastActorName: e.LastActorName,
+			RevisionCount: e.RevisionCount,
+		}
+	}
+	return out, nil
 }
 
 // ────────────────────────────────────────────────────────────────

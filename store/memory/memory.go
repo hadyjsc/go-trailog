@@ -5,7 +5,9 @@ package memory
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/hadyjsc/go-trailog/store"
 )
@@ -141,6 +143,149 @@ func (s *Store) ListRevisions(_ context.Context, f store.TimelineFilter) ([]stor
 		out = append(out, full)
 	}
 	return out, nextCursor, nil
+}
+
+// ListEntities returns a paginated list of distinct entities from the in-memory index.
+func (s *Store) ListEntities(_ context.Context, f store.ListEntitiesFilter) (*store.ListEntitiesResult, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	limit := f.Limit
+	if limit <= 0 || limit > 200 {
+		limit = 20
+	}
+
+	// Build one EntitySummary per (type, id) pair.
+	type key struct{ t, id string }
+	summaries := map[key]*store.EntitySummary{}
+
+	for revID, rev := range s.revisions {
+		for _, ec := range s.changes[revID] {
+			if f.EntityType != "" && ec.EntityType != f.EntityType {
+				continue
+			}
+			if f.Op != "" && ec.Op != f.Op {
+				continue
+			}
+			if f.ActorID != "" && rev.ActorID != f.ActorID {
+				continue
+			}
+			if !f.From.IsZero() && rev.OccurredAt.Before(f.From) {
+				continue
+			}
+			if !f.To.IsZero() && rev.OccurredAt.After(f.To) {
+				continue
+			}
+
+			k := key{ec.EntityType, ec.EntityID}
+			if s, ok := summaries[k]; !ok {
+				summaries[k] = &store.EntitySummary{
+					EntityType:    ec.EntityType,
+					EntityID:      ec.EntityID,
+					LastChangedAt: rev.OccurredAt,
+					LastOp:        ec.Op,
+					LastActorID:   rev.ActorID,
+					LastActorName: rev.ActorName,
+					RevisionCount: 1,
+				}
+			} else {
+				s.RevisionCount++
+				if rev.OccurredAt.After(s.LastChangedAt) {
+					s.LastChangedAt = rev.OccurredAt
+					s.LastOp = ec.Op
+					s.LastActorID = rev.ActorID
+					s.LastActorName = rev.ActorName
+				}
+			}
+		}
+	}
+
+	total := len(summaries)
+
+	// Collect and sort.
+	list := make([]*store.EntitySummary, 0, total)
+	for _, s := range summaries {
+		list = append(list, s)
+	}
+
+	sortDir := "desc"
+	if strings.ToLower(f.SortDir) == "asc" {
+		sortDir = "asc"
+	}
+	sortField := f.SortField
+	if sortField == "" {
+		sortField = "last_changed_at"
+	}
+
+	// Simple insertion sort (slices are small for in-memory use).
+	for i := 1; i < len(list); i++ {
+		for j := i; j > 0; j-- {
+			if entityLess(list[j], list[j-1], sortField, sortDir) {
+				list[j], list[j-1] = list[j-1], list[j]
+			} else {
+				break
+			}
+		}
+	}
+
+	// Apply cursor (opaque "<last_changed_at RFC3339Nano>|<last_entity_id>").
+	if f.Cursor != "" {
+		parts := strings.SplitN(f.Cursor, "|", 2)
+		if len(parts) == 2 {
+			cursorTime, err := time.Parse(time.RFC3339Nano, parts[0])
+			cursorID := parts[1]
+			if err == nil {
+				var after []*store.EntitySummary
+				past := false
+				for _, e := range list {
+					if past {
+						after = append(after, e)
+						continue
+					}
+					if e.LastChangedAt.Equal(cursorTime) && e.EntityID == cursorID {
+						past = true
+					}
+				}
+				list = after
+			}
+		}
+	}
+
+	nextCursor := ""
+	if len(list) > limit {
+		last := list[limit-1]
+		nextCursor = last.LastChangedAt.UTC().Format(time.RFC3339Nano) + "|" + last.EntityID
+		list = list[:limit]
+	}
+
+	out := make([]store.EntitySummary, len(list))
+	for i, e := range list {
+		out[i] = *e
+	}
+
+	return &store.ListEntitiesResult{
+		Entities:   out,
+		NextCursor: nextCursor,
+		Total:      total,
+	}, nil
+}
+
+// entityLess reports whether a should come before b under the given sort.
+func entityLess(a, b *store.EntitySummary, field, dir string) bool {
+	var less bool
+	switch field {
+	case "entity_type":
+		less = a.EntityType < b.EntityType || (a.EntityType == b.EntityType && a.EntityID < b.EntityID)
+	case "entity_id":
+		less = a.EntityID < b.EntityID
+	default: // last_changed_at
+		less = a.LastChangedAt.After(b.LastChangedAt) ||
+			(a.LastChangedAt.Equal(b.LastChangedAt) && a.EntityID < b.EntityID)
+	}
+	if dir == "asc" {
+		return !less
+	}
+	return less
 }
 
 // GetEntityChanges returns all entity changes for the given entity, newest first.

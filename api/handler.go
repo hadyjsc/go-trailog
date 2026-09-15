@@ -27,13 +27,28 @@ import (
 
 // Handler holds the service dependencies injected at construction time.
 type Handler struct {
-	timeline *timeline.Service
-	reverter *revert.Reverter
+	timeline  *timeline.Service
+	reverter  *revert.Reverter
+	applyMode revert.ApplyMode // controls whether revert writes to application tables
+}
+
+// HandlerOption configures a Handler.
+type HandlerOption func(*Handler)
+
+// WithAuditOnlyRevert sets the handler to audit-only revert mode: the audit
+// revision is persisted but no writes are made to the application tables.
+// Use this when the API server has no registered EntityRepository or RevertApplier.
+func WithAuditOnlyRevert() HandlerOption {
+	return func(h *Handler) { h.applyMode = revert.ApplyModeSkip }
 }
 
 // NewHandler creates an API Handler wired to the given services.
-func NewHandler(tl *timeline.Service, rv *revert.Reverter) *Handler {
-	return &Handler{timeline: tl, reverter: rv}
+func NewHandler(tl *timeline.Service, rv *revert.Reverter, opts ...HandlerOption) *Handler {
+	h := &Handler{timeline: tl, reverter: rv}
+	for _, o := range opts {
+		o(h)
+	}
+	return h
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -216,8 +231,15 @@ func (h *Handler) PreviewRevert(w http.ResponseWriter, r *http.Request) {
 
 // revertRequest is the JSON body accepted by ExecuteRevert.
 type revertRequest struct {
-	Strategy string `json:"strategy"` // "block" | "field_level" | "force"
-	Reason   string `json:"reason"`
+	// Strategy controls conflict resolution: "block" | "field_level" | "force"
+	Strategy string `json:"strategy"`
+	// Reason is stored on the new revert revision.
+	Reason string `json:"reason"`
+	// Target, when provided, puts the reverter into webhook mode.
+	// The reverter will POST a WebhookPayload to Target.URL instead of calling
+	// a registered EntityRepository or RevertApplier.
+	// Required when the audit service is running standalone (no registered repos).
+	Target *revert.WebhookTarget `json:"target,omitempty"`
 }
 
 // ExecuteRevert applies the revert and returns the new Revision.
@@ -235,6 +257,20 @@ func (h *Handler) ExecuteRevert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	opts := []revert.RevertOption{}
+
+	// Apply mode — precedence:
+	//   1. target in request body  → webhook mode (overrides handler default)
+	//   2. handler applyMode       → audit-only (standalone) or write (embedded)
+	if req.Target != nil {
+		if req.Target.URL == "" {
+			jsonError(w, "target.url is required when target is provided", http.StatusBadRequest)
+			return
+		}
+		opts = append(opts, revert.WithWebhookApplier(*req.Target))
+	} else if h.applyMode == revert.ApplyModeSkip {
+		opts = append(opts, revert.WithSkipApply())
+	}
+
 	switch revert.Strategy(req.Strategy) {
 	case revert.StrategyFieldLevel:
 		opts = append(opts, revert.WithStrategy(revert.StrategyFieldLevel))
@@ -253,7 +289,6 @@ func (h *Handler) ExecuteRevert(w http.ResponseWriter, r *http.Request) {
 			jsonError(w, err.Error(), http.StatusNotFound)
 			return
 		}
-		// Conflict errors from StrategyBlockOnConflict → 409.
 		if strings.Contains(err.Error(), "conflict") {
 			jsonError(w, err.Error(), http.StatusConflict)
 			return
@@ -262,6 +297,57 @@ func (h *Handler) ExecuteRevert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, newRev)
+}
+
+// ────────────────────────────────────────────────────────────────
+// GET /entities
+// ────────────────────────────────────────────────────────────────
+
+// GetEntities returns a paginated, sortable, filterable list of all distinct
+// (entity_type, entity_id) pairs that have at least one audit record.
+//
+// Query params:
+//
+//	entity_type=<type>         — filter to one entity type
+//	actor_id=<id>              — filter by last actor
+//	op=<create|update|delete>  — filter by last operation
+//	from=<RFC3339>             — last_changed_at >= from
+//	to=<RFC3339>               — last_changed_at <= to
+//	sort=<field>               — "last_changed_at" (default) | "entity_type" | "entity_id"
+//	dir=<asc|desc>             — sort direction (default "desc")
+//	limit=<int>                — page size (default 20, max 200)
+//	cursor=<opaque>            — pagination cursor from previous response
+func (h *Handler) GetEntities(w http.ResponseWriter, r *http.Request) {
+	q := timeline.EntityQuery{
+		EntityType: r.URL.Query().Get("entity_type"),
+		ActorID:    r.URL.Query().Get("actor_id"),
+		Op:         r.URL.Query().Get("op"),
+		SortField:  r.URL.Query().Get("sort"),
+		SortDir:    r.URL.Query().Get("dir"),
+		Cursor:     r.URL.Query().Get("cursor"),
+	}
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil {
+			q.Limit = n
+		}
+	}
+	if f := r.URL.Query().Get("from"); f != "" {
+		if t, err := time.Parse(time.RFC3339, f); err == nil {
+			q.From = t
+		}
+	}
+	if t := r.URL.Query().Get("to"); t != "" {
+		if ts, err := time.Parse(time.RFC3339, t); err == nil {
+			q.To = ts
+		}
+	}
+
+	result, err := h.timeline.ListEntities(r.Context(), q)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonOK(w, result)
 }
 
 // ────────────────────────────────────────────────────────────────

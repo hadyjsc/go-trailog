@@ -146,6 +146,160 @@ func (s *Store) SaveRevision(ctx context.Context, rev store.Revision) error {
 	return nil
 }
 
+// ListEntities returns a paginated list of distinct (entity_type, entity_id) pairs
+// enriched with metadata from their most recent audit change.
+func (s *Store) ListEntities(ctx context.Context, f store.ListEntitiesFilter) (*store.ListEntitiesResult, error) {
+	limit := f.Limit
+	if limit <= 0 || limit > 200 {
+		limit = 20
+	}
+
+	// Validate / normalise sort options.
+	sortCol := "last_changed_at"
+	switch f.SortField {
+	case "entity_type":
+		sortCol = "entity_type"
+	case "entity_id":
+		sortCol = "entity_id"
+	}
+	sortDir := "DESC"
+	if strings.ToLower(f.SortDir) == "asc" {
+		sortDir = "ASC"
+	}
+
+	args := []any{}
+	var conds []string
+	argIdx := 1
+
+	if f.EntityType != "" {
+		conds = append(conds, fmt.Sprintf("ec.entity_type = $%d", argIdx))
+		args = append(args, f.EntityType)
+		argIdx++
+	}
+	if f.ActorID != "" {
+		conds = append(conds, fmt.Sprintf("r.actor_id = $%d", argIdx))
+		args = append(args, f.ActorID)
+		argIdx++
+	}
+	if f.Op != "" {
+		conds = append(conds, fmt.Sprintf("ec.op = $%d", argIdx))
+		args = append(args, f.Op)
+		argIdx++
+	}
+	if !f.From.IsZero() {
+		conds = append(conds, fmt.Sprintf("r.occurred_at >= $%d", argIdx))
+		args = append(args, f.From)
+		argIdx++
+	}
+	if !f.To.IsZero() {
+		conds = append(conds, fmt.Sprintf("r.occurred_at <= $%d", argIdx))
+		args = append(args, f.To)
+		argIdx++
+	}
+
+	where := ""
+	if len(conds) > 0 {
+		where = "WHERE " + strings.Join(conds, " AND ")
+	}
+
+	// Count total matching entities (before pagination).
+	countQ := fmt.Sprintf(`
+		SELECT COUNT(*) FROM (
+			SELECT ec.entity_type, ec.entity_id
+			FROM audit_entity_change ec
+			JOIN audit_revision r ON r.id = ec.revision_id
+			%s
+			GROUP BY ec.entity_type, ec.entity_id
+		) sub`, where)
+	var total int
+	if err := s.db.QueryRowContext(ctx, countQ, args...).Scan(&total); err != nil {
+		return nil, fmt.Errorf("trailog/store/postgres: list entities count: %w", err)
+	}
+
+	// Cursor: decode "<last_occurred_at>|<last_entity_id>".
+	if f.Cursor != "" {
+		parts := strings.SplitN(f.Cursor, "|", 2)
+		if len(parts) == 2 {
+			cursorTime, err := time.Parse(time.RFC3339Nano, parts[0])
+			cursorID := parts[1]
+			if err == nil {
+				// Keyset pagination: rows that come after the cursor row in the chosen sort order.
+				cursorCond := ""
+				switch sortDir {
+				case "ASC":
+					cursorCond = fmt.Sprintf(
+						"(last_changed_at > $%d OR (last_changed_at = $%d AND entity_id > $%d))",
+						argIdx, argIdx+1, argIdx+2,
+					)
+				default:
+					cursorCond = fmt.Sprintf(
+						"(last_changed_at < $%d OR (last_changed_at = $%d AND entity_id > $%d))",
+						argIdx, argIdx+1, argIdx+2,
+					)
+				}
+				args = append(args, cursorTime, cursorTime, cursorID)
+				argIdx += 3
+				// The cursor filter applies to the outer query (after GROUP BY),
+				// so we wrap the whole thing as a subquery below.
+				_ = cursorCond // used inside the outer wrapper
+			}
+		}
+	}
+
+	// Build the main paginated query using a subquery so we can filter on
+	// the aggregated last_changed_at without repeating the GROUP BY logic.
+	args = append(args, limit)
+	mainQ := fmt.Sprintf(`
+		SELECT entity_type, entity_id, last_changed_at, last_op, last_actor_id, last_actor_name, revision_count
+		FROM (
+			SELECT
+				ec.entity_type,
+				ec.entity_id,
+				MAX(r.occurred_at)                                          AS last_changed_at,
+				(ARRAY_AGG(ec.op       ORDER BY r.occurred_at DESC))[1]     AS last_op,
+				(ARRAY_AGG(r.actor_id  ORDER BY r.occurred_at DESC))[1]     AS last_actor_id,
+				(ARRAY_AGG(r.actor_name ORDER BY r.occurred_at DESC))[1]    AS last_actor_name,
+				COUNT(DISTINCT r.id)                                        AS revision_count
+			FROM audit_entity_change ec
+			JOIN audit_revision r ON r.id = ec.revision_id
+			%s
+			GROUP BY ec.entity_type, ec.entity_id
+		) sub
+		ORDER BY %s %s, entity_id ASC
+		LIMIT $%d`, where, sortCol, sortDir, argIdx)
+
+	rows, err := s.db.QueryContext(ctx, mainQ, args...)
+	if err != nil {
+		return nil, fmt.Errorf("trailog/store/postgres: list entities: %w", err)
+	}
+	defer rows.Close()
+
+	var entities []store.EntitySummary
+	for rows.Next() {
+		var e store.EntitySummary
+		if err := rows.Scan(&e.EntityType, &e.EntityID, &e.LastChangedAt,
+			&e.LastOp, &e.LastActorID, &e.LastActorName, &e.RevisionCount); err != nil {
+			return nil, fmt.Errorf("trailog/store/postgres: scan entity summary: %w", err)
+		}
+		entities = append(entities, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	nextCursor := ""
+	if len(entities) == limit && limit > 0 {
+		last := entities[len(entities)-1]
+		nextCursor = last.LastChangedAt.UTC().Format(time.RFC3339Nano) + "|" + last.EntityID
+	}
+
+	return &store.ListEntitiesResult{
+		Entities:   entities,
+		NextCursor: nextCursor,
+		Total:      total,
+	}, nil
+}
+
 // GetRevision returns the full Revision (with EntityChanges and FieldDiffs).
 func (s *Store) GetRevision(ctx context.Context, id string) (*store.Revision, error) {
 	const q = `
