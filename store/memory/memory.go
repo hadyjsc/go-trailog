@@ -14,10 +14,11 @@ import (
 
 // Store is an in-memory implementation of store.Store, suitable for tests.
 type Store struct {
-	mu         sync.RWMutex
-	revisions  map[string]*store.Revision      // id → revision (without changes)
-	changes    map[string][]store.EntityChange // revision_id → changes
-	revertLogs map[string]*store.RevertLog     // id → revert log
+	mu             sync.RWMutex
+	revisions      map[string]*store.Revision
+	changes        map[string][]store.EntityChange
+	revertLogs     map[string]*store.RevertLog
+	webhookConfigs map[string]*store.WebhookTargetConfig
 	// Index: (entityType+":"+entityID) → []revisionID (insertion order)
 	entityIndex map[string][]string
 }
@@ -25,10 +26,11 @@ type Store struct {
 // New returns an empty in-memory Store.
 func New() *Store {
 	return &Store{
-		revisions:   make(map[string]*store.Revision),
-		changes:     make(map[string][]store.EntityChange),
-		revertLogs:  make(map[string]*store.RevertLog),
-		entityIndex: make(map[string][]string),
+		revisions:      make(map[string]*store.Revision),
+		changes:        make(map[string][]store.EntityChange),
+		revertLogs:     make(map[string]*store.RevertLog),
+		webhookConfigs: make(map[string]*store.WebhookTargetConfig),
+		entityIndex:    make(map[string][]string),
 	}
 }
 
@@ -374,4 +376,68 @@ func sortRevisions(revs []*store.Revision) {
 			revs[j], revs[j-1] = revs[j-1], revs[j]
 		}
 	}
+}
+
+// ────────────────────────────────────────────────────────────────
+// WebhookTargetConfig
+// ────────────────────────────────────────────────────────────────
+
+// GetWebhookTargetConfig returns the stored webhook target for an entity type.
+func (s *Store) GetWebhookTargetConfig(_ context.Context, entityType string) (*store.WebhookTargetConfig, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	c, ok := s.webhookConfigs[entityType]
+	if !ok {
+		return nil, nil
+	}
+	cp := *c
+	return &cp, nil
+}
+
+// SaveWebhookTargetConfig upserts the webhook target configuration.
+func (s *Store) SaveWebhookTargetConfig(_ context.Context, cfg store.WebhookTargetConfig) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cfg.TimeoutSecs <= 0 {
+		cfg.TimeoutSecs = 30
+	}
+	now := time.Now().UTC()
+	if existing, ok := s.webhookConfigs[cfg.EntityType]; ok {
+		cfg.CreatedAt = existing.CreatedAt
+	} else {
+		cfg.CreatedAt = now
+	}
+	cfg.UpdatedAt = now
+	s.webhookConfigs[cfg.EntityType] = &cfg
+	return nil
+}
+
+// DeleteWebhookTargetConfig removes the webhook target configuration.
+func (s *Store) DeleteWebhookTargetConfig(_ context.Context, entityType string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.webhookConfigs, entityType)
+	return nil
+}
+
+// DeleteRevision removes a revision and its changes from the in-memory store.
+func (s *Store) DeleteRevision(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Remove from entity index.
+	for _, ec := range s.changes[id] {
+		key := ec.EntityType + ":" + ec.EntityID
+		ids := s.entityIndex[key]
+		var filtered []string
+		for _, rid := range ids {
+			if rid != id {
+				filtered = append(filtered, rid)
+			}
+		}
+		s.entityIndex[key] = filtered
+	}
+	delete(s.changes, id)
+	delete(s.revisions, id)
+	return nil
 }

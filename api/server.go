@@ -9,6 +9,7 @@ import (
 
 	"github.com/hadyjsc/go-trailog/integration/httpmw"
 	"github.com/hadyjsc/go-trailog/revert"
+	"github.com/hadyjsc/go-trailog/store"
 	"github.com/hadyjsc/go-trailog/timeline"
 )
 
@@ -52,10 +53,11 @@ func NewServer(
 	cfg ServerConfig,
 	tl *timeline.Service,
 	rv *revert.Reverter,
+	st store.Store,
 	actorExtractor httpmw.ActorExtractor,
 	handlerOpts ...HandlerOption,
 ) *Server {
-	h := NewHandler(tl, rv, handlerOpts...)
+	h := NewHandler(tl, rv, st, handlerOpts...)
 	mux := http.NewServeMux()
 
 	// ── Routes ──────────────────────────────────────────────────
@@ -96,6 +98,20 @@ func NewServer(
 			h.ExecuteRevert(w, r)
 		case r.Method == http.MethodGet:
 			h.GetRevision(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	// Webhook target config CRUD — /webhook-targets/{entity_type}
+	mux.HandleFunc("/webhook-targets/", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			h.GetWebhookTarget(w, r)
+		case http.MethodPut:
+			h.UpsertWebhookTarget(w, r)
+		case http.MethodDelete:
+			h.DeleteWebhookTarget(w, r)
 		default:
 			http.NotFound(w, r)
 		}

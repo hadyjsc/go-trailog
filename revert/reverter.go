@@ -338,6 +338,13 @@ func (rv *Reverter) PreviewRevert(ctx context.Context, revisionID string, opts .
 }
 
 // RevertRevision executes the revert of an entire multi-table revision.
+// Order of operations:
+//  1. Validate / plan (conflicts, create-order guard, topo sort)
+//  2. SaveRevision — write the audit record first so we have a revision ID
+//  3. For each entity: resolve webhook target (per-request → stored config → error)
+//     and call applyRevert. On ANY failure, DeleteRevision rolls back the audit
+//     record and the error is returned to the caller.
+//  4. SaveRevertLog
 func (rv *Reverter) RevertRevision(ctx context.Context, revisionID string, opts ...RevertOption) (*store.Revision, error) {
 	o := applyOpts(opts)
 
@@ -351,9 +358,7 @@ func (rv *Reverter) RevertRevision(ctx context.Context, revisionID string, opts 
 			len(plan.Conflicts), conflictSummary(plan.Conflicts))
 	}
 
-	// Create-order conflicts (Field == "*") are structural and can never be
-	// bypassed — even StrategyForceOverwrite cannot delete an entity that has
-	// later audit records, because that would silently orphan audit history.
+	// Create-order conflicts (Field == "*") are structural and can never be bypassed.
 	for _, c := range plan.Conflicts {
 		if c.Field == "*" {
 			return nil, fmt.Errorf("trailog/revert: %s", c.Reason)
@@ -367,7 +372,7 @@ func (rv *Reverter) RevertRevision(ctx context.Context, revisionID string, opts 
 		return nil, fmt.Errorf("trailog/revert: topo sort: %w", err)
 	}
 
-	// Apply each entity in sorted order.
+	// Build the new audit revision struct (no DB write yet).
 	newRevID := uuid.New().String()
 	newRev := store.Revision{
 		ID:            newRevID,
@@ -380,24 +385,17 @@ func (rv *Reverter) RevertRevision(ctx context.Context, revisionID string, opts 
 		newRev.Reason = fmt.Sprintf("Reverted revision %s", revisionID)
 	}
 
+	// Collect entity changes we will write.
 	var newChanges []store.EntityChange
-
 	for _, e := range sorted {
 		action := actionForEntity(plan.Actions, e.Type, e.ID)
 		if action == nil {
 			continue
 		}
-
 		toState := action.ToState
 		if o.strategy == StrategyFieldLevel && action.HasConflict {
-			// Only restore fields not touched since target revision.
 			toState = filterUntouched(action.ToState, action.FromState, plan.Conflicts, e.Type, e.ID)
 		}
-
-		if err := rv.applyRevert(ctx, e.Type, e.ID, action.Op, action.FromState, toState, o.applyMode, o.webhookTarget, newRevID); err != nil {
-			return nil, err
-		}
-
 		ecID := uuid.New().String()
 		newChanges = append(newChanges, store.EntityChange{
 			ID:             ecID,
@@ -409,10 +407,11 @@ func (rv *Reverter) RevertRevision(ctx context.Context, revisionID string, opts 
 			SnapshotAfter:  toState,
 		})
 	}
-
 	newRev.Changes = newChanges
 
-	// Hash chaining (tamper-evidence).
+	// ── Step 2: persist the audit revision BEFORE calling webhooks ──────────
+	// This gives us a stable revision ID to include in the WebhookPayload so
+	// the receiving service can reference the audit record immediately.
 	prevHash, _ := rv.store.LastRevisionHash(ctx)
 	newRev.PrevHash = prevHash
 	newRev.Hash = computeHash(newRev)
@@ -421,6 +420,49 @@ func (rv *Reverter) RevertRevision(ctx context.Context, revisionID string, opts 
 		return nil, fmt.Errorf("trailog/revert: save revert revision: %w", err)
 	}
 
+	// ── Step 3: apply each entity write (webhook / applier / repo) ───────────
+	// On any failure, roll back the audit revision we just saved.
+	for _, e := range sorted {
+		action := actionForEntity(plan.Actions, e.Type, e.ID)
+		if action == nil {
+			continue
+		}
+		// Find the toState we already computed above.
+		var toState map[string]any
+		for _, ec := range newChanges {
+			if ec.EntityType == e.Type && ec.EntityID == e.ID {
+				toState = ec.SnapshotAfter
+				break
+			}
+		}
+
+		// Resolve the webhook target for this entity:
+		//   per-request target > stored config > fallback to mode
+		mode := o.applyMode
+		webhook := o.webhookTarget
+		if mode != ApplyModeSkip && mode != ApplyModeWebhook {
+			// Not already in webhook mode — check stored config.
+			if storedCfg, err := rv.store.GetWebhookTargetConfig(ctx, e.Type); err == nil && storedCfg != nil {
+				mode = ApplyModeWebhook
+				webhook = &WebhookTarget{
+					URL:     storedCfg.URL,
+					Method:  storedCfg.Method,
+					Auth:    storedCfg.Auth,
+					Timeout: storedCfg.TimeoutSecs,
+				}
+			}
+		}
+
+		if applyErr := rv.applyRevert(ctx, e.Type, e.ID, action.Op, action.FromState, toState, mode, webhook, newRevID); applyErr != nil {
+			// Roll back the audit revision — best-effort; log if it also fails.
+			if rollbackErr := rv.store.DeleteRevision(ctx, newRevID); rollbackErr != nil {
+				return nil, fmt.Errorf("trailog/revert: apply failed (%w) and rollback also failed (%v) — audit revision %s is orphaned", applyErr, rollbackErr, newRevID)
+			}
+			return nil, fmt.Errorf("trailog/revert: apply %s on %s:%s failed, audit revision rolled back: %w", action.Op, e.Type, e.ID, applyErr)
+		}
+	}
+
+	// ── Step 4: revert log ───────────────────────────────────────────────────
 	hadConflicts := len(plan.Conflicts) > 0
 	rl := store.RevertLog{
 		ID:               uuid.New().String(),
@@ -591,7 +633,7 @@ func (rv *Reverter) applyRevert(ctx context.Context, entityType, entityID, op st
 
 	repo := rv.repos.Get(entityType)
 	if repo == nil {
-		return fmt.Errorf("trailog/revert: no repository or applier registered for entity type %q — register one with WithRepository or WithRevertApplier", entityType)
+		return fmt.Errorf("trailog/revert: no repository, applier, or webhook target configured for entity type %q — register one with WithRepository, WithRevertApplier, or configure a webhook target via the API", entityType)
 	}
 
 	var err error

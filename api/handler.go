@@ -21,7 +21,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hadyjsc/go-trailog/revert"
+	"github.com/hadyjsc/go-trailog/store"
 	"github.com/hadyjsc/go-trailog/timeline"
 )
 
@@ -29,7 +31,8 @@ import (
 type Handler struct {
 	timeline  *timeline.Service
 	reverter  *revert.Reverter
-	applyMode revert.ApplyMode // controls whether revert writes to application tables
+	store     store.Store  // for webhook target config CRUD
+	applyMode revert.ApplyMode
 }
 
 // HandlerOption configures a Handler.
@@ -43,8 +46,8 @@ func WithAuditOnlyRevert() HandlerOption {
 }
 
 // NewHandler creates an API Handler wired to the given services.
-func NewHandler(tl *timeline.Service, rv *revert.Reverter, opts ...HandlerOption) *Handler {
-	h := &Handler{timeline: tl, reverter: rv}
+func NewHandler(tl *timeline.Service, rv *revert.Reverter, st store.Store, opts ...HandlerOption) *Handler {
+	h := &Handler{timeline: tl, reverter: rv, store: st}
 	for _, o := range opts {
 		o(h)
 	}
@@ -230,19 +233,31 @@ func (h *Handler) PreviewRevert(w http.ResponseWriter, r *http.Request) {
 // ────────────────────────────────────────────────────────────────
 
 // revertRequest is the JSON body accepted by ExecuteRevert.
+// All fields are validated before calling the reverter.
 type revertRequest struct {
-	// Strategy controls conflict resolution: "block" | "field_level" | "force"
+	// Strategy controls conflict resolution: "block" | "field_level" | "force".
+	// Defaults to "block" if omitted.
 	Strategy string `json:"strategy"`
-	// Reason is stored on the new revert revision.
+	// Reason is a mandatory human-readable description of why this revert is
+	// being executed. Stored on the new revert revision.
 	Reason string `json:"reason"`
-	// Target, when provided, puts the reverter into webhook mode.
-	// The reverter will POST a WebhookPayload to Target.URL instead of calling
-	// a registered EntityRepository or RevertApplier.
-	// Required when the audit service is running standalone (no registered repos).
+	// Target overrides the stored per-entity-type webhook config for this call.
+	// When provided: url is required; method defaults to POST; auth is optional.
+	// When omitted: the reverter uses the stored config for each entity type.
+	// If neither a per-request target nor a stored config exists for an entity
+	// type, the revert is rejected with 422.
 	Target *revert.WebhookTarget `json:"target,omitempty"`
 }
 
-// ExecuteRevert applies the revert and returns the new Revision.
+// validMethods is the set of HTTP methods accepted for webhook targets.
+var validMethods = map[string]struct{}{
+	"POST":  {},
+	"PUT":   {},
+	"PATCH": {},
+}
+
+// ExecuteRevert validates the request body, resolves the webhook target,
+// and applies the revert. Returns the new audit Revision on success.
 func (h *Handler) ExecuteRevert(w http.ResponseWriter, r *http.Request) {
 	revID := pathRevertRevisionID(r, "")
 	if revID == "" {
@@ -251,24 +266,51 @@ func (h *Handler) ExecuteRevert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req revertRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err.Error() == "EOF" {
+			jsonError(w, "request body is required", http.StatusBadRequest)
+			return
+		}
 		jsonError(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	opts := []revert.RevertOption{}
+	// ── Validate required fields ────────────────────────────────────────────
+	if strings.TrimSpace(req.Reason) == "" {
+		jsonError(w, "reason is required", http.StatusBadRequest)
+		return
+	}
 
-	// Apply mode — precedence:
-	//   1. target in request body  → webhook mode (overrides handler default)
-	//   2. handler applyMode       → audit-only (standalone) or write (embedded)
 	if req.Target != nil {
-		if req.Target.URL == "" {
+		if strings.TrimSpace(req.Target.URL) == "" {
 			jsonError(w, "target.url is required when target is provided", http.StatusBadRequest)
 			return
 		}
+		method := strings.ToUpper(strings.TrimSpace(req.Target.Method))
+		if method == "" {
+			req.Target.Method = "POST"
+		} else {
+			if _, ok := validMethods[method]; !ok {
+				jsonError(w, "target.method must be POST, PUT, or PATCH", http.StatusBadRequest)
+				return
+			}
+			req.Target.Method = method
+		}
+	}
+
+	// ── Build revert options ────────────────────────────────────────────────
+	opts := []revert.RevertOption{}
+
+	if req.Target != nil {
+		// Explicit per-request target — always use webhook mode.
 		opts = append(opts, revert.WithWebhookApplier(*req.Target))
 	} else if h.applyMode == revert.ApplyModeSkip {
-		opts = append(opts, revert.WithSkipApply())
+		// Standalone server with no per-request target.
+		// RevertRevision will look up stored config per entity type and error if
+		// none is found, so we pass through without forcing skip.
+		// (ApplyModeWrite is the default; stored config resolution happens inside
+		// the reverter when neither a per-request target nor a registered applier
+		// is present.)
 	}
 
 	switch revert.Strategy(req.Strategy) {
@@ -279,9 +321,7 @@ func (h *Handler) ExecuteRevert(w http.ResponseWriter, r *http.Request) {
 	default:
 		opts = append(opts, revert.WithStrategy(revert.StrategyBlockOnConflict))
 	}
-	if req.Reason != "" {
-		opts = append(opts, revert.WithReason(req.Reason))
-	}
+	opts = append(opts, revert.WithReason(req.Reason))
 
 	newRev, err := h.reverter.RevertRevision(r.Context(), revID, opts...)
 	if err != nil {
@@ -291,6 +331,11 @@ func (h *Handler) ExecuteRevert(w http.ResponseWriter, r *http.Request) {
 		}
 		if strings.Contains(err.Error(), "conflict") {
 			jsonError(w, err.Error(), http.StatusConflict)
+			return
+		}
+		if strings.Contains(err.Error(), "no repository or applier") ||
+			strings.Contains(err.Error(), "no webhook target") {
+			jsonError(w, err.Error(), http.StatusUnprocessableEntity)
 			return
 		}
 		jsonError(w, err.Error(), http.StatusInternalServerError)
@@ -348,6 +393,126 @@ func (h *Handler) GetEntities(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, result)
+}
+
+// ────────────────────────────────────────────────────────────────
+// GET /webhook-targets/{entity_type}
+// PUT /webhook-targets/{entity_type}
+// DELETE /webhook-targets/{entity_type}
+// ────────────────────────────────────────────────────────────────
+
+// webhookTargetRequest is the JSON body for PUT /webhook-targets/{entity_type}.
+type webhookTargetRequest struct {
+	URL         string `json:"url"`
+	Method      string `json:"method"`
+	Auth        string `json:"auth"`
+	TimeoutSecs int    `json:"timeout_secs"`
+}
+
+// GetWebhookTarget returns the stored webhook target config for an entity type.
+func (h *Handler) GetWebhookTarget(w http.ResponseWriter, r *http.Request) {
+	entityType := pathSegment(r, "/webhook-targets/")
+	if entityType == "" {
+		jsonError(w, "missing entity_type in path", http.StatusBadRequest)
+		return
+	}
+
+	cfg, err := h.store.GetWebhookTargetConfig(r.Context(), entityType)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if cfg == nil {
+		jsonError(w, "no webhook target configured for entity type "+entityType, http.StatusNotFound)
+		return
+	}
+	// Mask the auth value in the response — return only whether it is set.
+	out := map[string]any{
+		"id":           cfg.ID,
+		"entity_type":  cfg.EntityType,
+		"url":          cfg.URL,
+		"method":       cfg.Method,
+		"auth_set":     cfg.Auth != "",
+		"timeout_secs": cfg.TimeoutSecs,
+		"created_at":   cfg.CreatedAt,
+		"updated_at":   cfg.UpdatedAt,
+	}
+	jsonOK(w, out)
+}
+
+// UpsertWebhookTarget creates or updates the webhook target config for an entity type.
+func (h *Handler) UpsertWebhookTarget(w http.ResponseWriter, r *http.Request) {
+	entityType := pathSegment(r, "/webhook-targets/")
+	if entityType == "" {
+		jsonError(w, "missing entity_type in path", http.StatusBadRequest)
+		return
+	}
+
+	var req webhookTargetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err.Error() == "EOF" {
+			jsonError(w, "request body is required", http.StatusBadRequest)
+			return
+		}
+		jsonError(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Validate.
+	if strings.TrimSpace(req.URL) == "" {
+		jsonError(w, "url is required", http.StatusBadRequest)
+		return
+	}
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	if method == "" {
+		method = "POST"
+	}
+	if _, ok := validMethods[method]; !ok {
+		jsonError(w, "method must be POST, PUT, or PATCH", http.StatusBadRequest)
+		return
+	}
+	timeout := req.TimeoutSecs
+	if timeout <= 0 {
+		timeout = 30
+	}
+
+	cfg := store.WebhookTargetConfig{
+		ID:          uuid.New().String(),
+		EntityType:  entityType,
+		URL:         strings.TrimSpace(req.URL),
+		Method:      method,
+		Auth:        req.Auth,
+		TimeoutSecs: timeout,
+	}
+	if err := h.store.SaveWebhookTargetConfig(r.Context(), cfg); err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Return the saved config (masking auth).
+	out := map[string]any{
+		"entity_type":  cfg.EntityType,
+		"url":          cfg.URL,
+		"method":       cfg.Method,
+		"auth_set":     cfg.Auth != "",
+		"timeout_secs": cfg.TimeoutSecs,
+	}
+	jsonOK(w, out)
+}
+
+// DeleteWebhookTarget removes the webhook target config for an entity type.
+func (h *Handler) DeleteWebhookTarget(w http.ResponseWriter, r *http.Request) {
+	entityType := pathSegment(r, "/webhook-targets/")
+	if entityType == "" {
+		jsonError(w, "missing entity_type in path", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.store.DeleteWebhookTargetConfig(r.Context(), entityType); err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonOK(w, map[string]any{"entity_type": entityType, "deleted": true})
 }
 
 // ────────────────────────────────────────────────────────────────

@@ -49,6 +49,19 @@ type FieldDiff struct {
 	ValueType      string
 }
 
+// WebhookTargetConfig stores the per-entity-type webhook endpoint configuration
+// used by the revert engine when no per-request target is supplied.
+type WebhookTargetConfig struct {
+	ID          string    `json:"id"`
+	EntityType  string    `json:"entity_type"`
+	URL         string    `json:"url"`
+	Method      string    `json:"method"`       // POST | PUT | PATCH
+	Auth        string    `json:"auth"`         // verbatim Authorization header value
+	TimeoutSecs int       `json:"timeout_secs"` // default 30
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 // RevertLog records the traceability link between a revert revision and its target.
 type RevertLog struct {
 	ID               string
@@ -156,6 +169,23 @@ type Store interface {
 	// LastRevisionHash returns the hash field of the most recently written
 	// Revision, used to build the tamper-evidence chain.
 	LastRevisionHash(ctx context.Context) (string, error)
+
+	// DeleteRevision removes a revision and all its EntityChanges and FieldDiffs.
+	// Used exclusively by the revert engine to roll back an audit record when the
+	// downstream webhook call fails after SaveRevision was already committed.
+	DeleteRevision(ctx context.Context, id string) error
+
+	// GetWebhookTargetConfig returns the stored webhook target for an entity type,
+	// or nil if none is configured.
+	GetWebhookTargetConfig(ctx context.Context, entityType string) (*WebhookTargetConfig, error)
+
+	// SaveWebhookTargetConfig upserts (insert-or-update) the webhook target
+	// configuration for an entity type.
+	SaveWebhookTargetConfig(ctx context.Context, cfg WebhookTargetConfig) error
+
+	// DeleteWebhookTargetConfig removes the webhook target configuration for an
+	// entity type. Returns nil if no row existed.
+	DeleteWebhookTargetConfig(ctx context.Context, entityType string) error
 
 	// Ping verifies the store is reachable (used at startup).
 	Ping(ctx context.Context) error

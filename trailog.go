@@ -76,6 +76,9 @@ func (t *Trailog) Relations() *relation.Registry { return t.rel }
 // Repos returns the repository registry (for registering entity repos after startup).
 func (t *Trailog) Repos() *revert.RepositoryRegistry { return t.repos }
 
+// Store returns the underlying store (for direct store operations such as webhook target config management).
+func (t *Trailog) Store() store.Store { return t.store }
+
 // Close shuts down the async dispatcher (if any) and the store.
 func (t *Trailog) Close() error {
 	t.disp.close()

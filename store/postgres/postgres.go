@@ -677,3 +677,109 @@ func nullableJSON(b []byte) sql.NullString {
 	}
 	return sql.NullString{String: string(b), Valid: true}
 }
+
+// ────────────────────────────────────────────────────────────────
+// WebhookTargetConfig
+// ────────────────────────────────────────────────────────────────
+
+// GetWebhookTargetConfig returns the stored webhook target for an entity type,
+// or nil if none is configured.
+func (s *Store) GetWebhookTargetConfig(ctx context.Context, entityType string) (*store.WebhookTargetConfig, error) {
+	const q = `
+		SELECT id, entity_type, url, method, auth, timeout_secs, created_at, updated_at
+		FROM audit_webhook_target_config
+		WHERE entity_type = $1`
+
+	var c store.WebhookTargetConfig
+	var auth sql.NullString
+	err := s.db.QueryRowContext(ctx, q, entityType).Scan(
+		&c.ID, &c.EntityType, &c.URL, &c.Method, &auth,
+		&c.TimeoutSecs, &c.CreatedAt, &c.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("trailog/store/postgres: get webhook target config: %w", err)
+	}
+	c.Auth = auth.String
+	return &c, nil
+}
+
+// SaveWebhookTargetConfig upserts the webhook target configuration for an entity type.
+func (s *Store) SaveWebhookTargetConfig(ctx context.Context, cfg store.WebhookTargetConfig) error {
+	const q = `
+		INSERT INTO audit_webhook_target_config
+			(id, entity_type, url, method, auth, timeout_secs, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,now(),now())
+		ON CONFLICT (entity_type) DO UPDATE SET
+			url          = EXCLUDED.url,
+			method       = EXCLUDED.method,
+			auth         = EXCLUDED.auth,
+			timeout_secs = EXCLUDED.timeout_secs,
+			updated_at   = now()`
+
+	timeout := cfg.TimeoutSecs
+	if timeout <= 0 {
+		timeout = 30
+	}
+	_, err := s.db.ExecContext(ctx, q,
+		cfg.ID, cfg.EntityType, cfg.URL, cfg.Method,
+		nullableString(cfg.Auth), timeout,
+	)
+	if err != nil {
+		return fmt.Errorf("trailog/store/postgres: save webhook target config: %w", err)
+	}
+	return nil
+}
+
+// DeleteWebhookTargetConfig removes the webhook target configuration for an entity type.
+func (s *Store) DeleteWebhookTargetConfig(ctx context.Context, entityType string) error {
+	const q = `DELETE FROM audit_webhook_target_config WHERE entity_type = $1`
+	if _, err := s.db.ExecContext(ctx, q, entityType); err != nil {
+		return fmt.Errorf("trailog/store/postgres: delete webhook target config: %w", err)
+	}
+	return nil
+}
+
+// nullableString wraps a string in sql.NullString; empty string becomes NULL.
+func nullableString(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: s, Valid: true}
+}
+
+// DeleteRevision removes a revision and its child rows (field diffs → entity changes → revision).
+// Used only by the revert rollback path.
+func (s *Store) DeleteRevision(ctx context.Context, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("trailog/store/postgres: delete revision begin tx: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Delete field diffs for all entity changes in this revision.
+	if _, err = tx.ExecContext(ctx, `
+		DELETE FROM audit_field_diff
+		WHERE entity_change_id IN (
+			SELECT id FROM audit_entity_change WHERE revision_id = $1
+		)`, id); err != nil {
+		return fmt.Errorf("trailog/store/postgres: delete field diffs: %w", err)
+	}
+	// Delete entity changes.
+	if _, err = tx.ExecContext(ctx,
+		`DELETE FROM audit_entity_change WHERE revision_id = $1`, id); err != nil {
+		return fmt.Errorf("trailog/store/postgres: delete entity changes: %w", err)
+	}
+	// Delete the revision itself.
+	if _, err = tx.ExecContext(ctx,
+		`DELETE FROM audit_revision WHERE id = $1`, id); err != nil {
+		return fmt.Errorf("trailog/store/postgres: delete revision: %w", err)
+	}
+	return tx.Commit()
+}

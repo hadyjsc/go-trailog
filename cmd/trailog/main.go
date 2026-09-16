@@ -103,12 +103,8 @@ func run() error {
 		srvCfg,
 		tl.Timeline(),
 		tl.Reverter(),
+		tl.Store(),
 		httpmw.ActorFromJWT, // swap for httpmw.ActorFromHeader for service-to-service
-		// The standalone service has no application-table adapters registered,
-		// so revert only persists the audit revision without writing back to the
-		// source tables. Embedders who register WithRepository / WithRevertApplier
-		// should omit this option so their appliers are called.
-		api.WithAuditOnlyRevert(),
 	)
 
 	// ── 6. Graceful shutdown on SIGINT / SIGTERM ──────────────────
