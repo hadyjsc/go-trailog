@@ -97,6 +97,7 @@ func run() error {
 		ReadTimeout:  cfg.HTTPReadTimeout,
 		WriteTimeout: cfg.HTTPWriteTimeout,
 		IdleTimeout:  cfg.HTTPIdleTimeout,
+		CORSOrigins:  cfg.CORSOrigins,
 	}
 	srv := api.NewServer(
 		srvCfg,

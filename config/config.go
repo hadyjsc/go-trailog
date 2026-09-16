@@ -14,6 +14,7 @@
 //	TRAILOG_ASYNC_BUFFER    int            (default: 512)
 //	TRAILOG_ASYNC_WORKERS   int            (default: 4)
 //	TRAILOG_LOG_LEVEL       debug | info | warn | error  (default: info)
+//	TRAILOG_CORS_ORIGINS    comma-separated allowed origins (default: *)
 //	TRAILOG_ENV_FILE        path to .env file  (default: .env — loaded only if file exists)
 package config
 
@@ -47,6 +48,10 @@ type Config struct {
 	HTTPReadTimeout  time.Duration
 	HTTPWriteTimeout time.Duration
 	HTTPIdleTimeout  time.Duration
+	// CORSOrigins is a comma-separated list of allowed origins for CORS requests.
+	// Use "*" to allow all origins (default). Use "" to disable CORS headers entirely.
+	// Example: "https://app.example.com,https://admin.example.com"
+	CORSOrigins string
 
 	// Dispatcher
 	Async        bool
@@ -126,6 +131,7 @@ func readEnvVars() (*Config, error) {
 	c.HTTPReadTimeout = getDuration("TRAILOG_HTTP_READ_TIMEOUT", 15*time.Second)
 	c.HTTPWriteTimeout = getDuration("TRAILOG_HTTP_WRITE_TIMEOUT", 30*time.Second)
 	c.HTTPIdleTimeout = getDuration("TRAILOG_HTTP_IDLE_TIMEOUT", 60*time.Second)
+	c.CORSOrigins = getEnv("TRAILOG_CORS_ORIGINS", "*")
 
 	// ── Dispatcher ───────────────────────────────────────────────
 	c.Async = getBool("TRAILOG_ASYNC", false)

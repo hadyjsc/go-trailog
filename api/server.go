@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/hadyjsc/go-trailog/integration/httpmw"
@@ -24,6 +25,12 @@ type ServerConfig struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 	IdleTimeout  time.Duration
+	// CORSOrigins is a comma-separated list of origins allowed by the CORS middleware.
+	// Special values:
+	//   ""  — CORS headers are not set (disables CORS handling entirely).
+	//   "*" — All origins are allowed (default; suitable for development).
+	// Example: "https://app.example.com,https://admin.example.com"
+	CORSOrigins string
 }
 
 // DefaultServerConfig returns sensible production defaults.
@@ -94,13 +101,17 @@ func NewServer(
 		}
 	})
 
-	// Wrap the mux with middleware chain: logger → actor injection → content-type guard.
+	// Wrap the mux with middleware chain (outermost first):
+	// CORS → logger → actor injection → content-type guard → mux
 	var root http.Handler = mux
 	root = jsonContentTypeMiddleware(root)
 	if actorExtractor != nil {
 		root = httpmw.Middleware(actorExtractor)(root)
 	}
 	root = requestLoggerMiddleware(root)
+	if cfg.CORSOrigins != "" {
+		root = corsMiddleware(cfg.CORSOrigins)(root)
+	}
 
 	s := &Server{
 		handler: h,
@@ -168,6 +179,70 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.status = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+// corsMiddleware adds CORS response headers and handles preflight OPTIONS requests.
+//
+// allowedOrigins is a comma-separated list of allowed origin values.
+// Pass "*" to allow any origin. The middleware matches the request Origin header
+// against the list; on a match it echoes the origin back (for credentialed requests)
+// or reflects "*" for wildcard mode. On no match, no CORS headers are set.
+//
+// Preflight (OPTIONS) requests are answered immediately with 204 No Content so
+// they do not reach downstream handlers or the auth middleware.
+func corsMiddleware(allowedOrigins string) func(http.Handler) http.Handler {
+	// Parse once at construction time.
+	wildcard := false
+	allowed := map[string]struct{}{}
+	for _, o := range strings.Split(allowedOrigins, ",") {
+		o = strings.TrimSpace(o)
+		if o == "*" {
+			wildcard = true
+		} else if o != "" {
+			allowed[o] = struct{}{}
+		}
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+
+			// No Origin header — not a CORS request; skip header injection.
+			if origin == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Determine whether to allow this origin.
+			allow := false
+			if wildcard {
+				allow = true
+			} else if _, ok := allowed[origin]; ok {
+				allow = true
+			}
+
+			if allow {
+				if wildcard {
+					w.Header().Set("Access-Control-Allow-Origin", "*")
+				} else {
+					// Echo the specific origin so credentialed requests work.
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+					w.Header().Set("Vary", "Origin")
+				}
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, X-Correlation-ID")
+				w.Header().Set("Access-Control-Max-Age", "86400") // 24 h preflight cache
+			}
+
+			// Preflight — answer immediately; no need to hit downstream.
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // hasSuffix checks if path ends with suffix after stripping query strings.
